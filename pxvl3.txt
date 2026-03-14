@@ -1,0 +1,300 @@
+// =======================
+// CONFIG
+// =======================
+let MODE = "normal"; // normal / fast
+const ROCK_MIN = 0;
+const ROCK_MAX = 5;
+const SELL_EVERY_SUCCESS = 50;
+const LOW_CAPACITY_FREE_SLOT_TRIGGER = 4;
+
+let running = true;
+let rockIndex = ROCK_MIN;
+let invalidRocks = new Set();
+let successCount = 0;
+let nextSellAt = SELL_EVERY_SUCCESS;
+let lastNearFullSellAttemptAt = 0;
+
+function normalizeToken(raw) {
+  if (!raw) return "";
+  return String(raw).replace(/^Bearer\s+/i, "").trim();
+}
+
+function getToken() {
+  return normalizeToken(
+    localStorage.getItem("pixelvalley_token") ||
+    localStorage.getItem("token") ||
+    sessionStorage.getItem("pixelvalley_token")
+  );
+}
+
+function getDelay() {
+  if (MODE === "fast") {
+    return Math.floor(Math.random() * 500) + 1000; // 1 - 1.5 detik
+  }
+  return Math.floor(Math.random() * 2001) + 3000; // 3 - 5 detik
+}
+
+function stop(reason) {
+  console.log("[STOP]", reason);
+  running = false;
+}
+
+function nextRock() {
+  rockIndex++;
+  if (rockIndex > ROCK_MAX) rockIndex = ROCK_MIN;
+}
+
+function getCapacity(snapshot) {
+  return Number(snapshot?.character?.capacity ?? snapshot?.capacity ?? 0);
+}
+
+function getDailyMined(snapshot) {
+  return Number(snapshot?.character?.dailyMinedToday ?? snapshot?.dailyMinedToday ?? 0);
+}
+
+function getDailyLimit(snapshot) {
+  return Number(snapshot?.character?.dailyMiningLimit ?? snapshot?.dailyMiningLimit ?? 0);
+}
+
+function countFilledSlots(slots = []) {
+  return slots.filter(s => s.resourceType !== "empty").length;
+}
+
+function sumResources(slots = []) {
+  const totals = { gold: 0, silver: 0, bronze: 0 };
+  for (const s of slots) {
+    if (Object.prototype.hasOwnProperty.call(totals, s.resourceType)) {
+      totals[s.resourceType] += Number(s.count || 0);
+    }
+  }
+  return totals;
+}
+
+async function fetchCharacter(token) {
+  try {
+    const res = await fetch("/api/character", {
+      credentials: "include",
+      headers: {
+        "Authorization": `Bearer ${token}`
+      }
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function logCharacter(data) {
+  if (!data) return;
+  const totals = sumResources(data.slots || []);
+  const capacity = getCapacity(data);
+  const filled = countFilledSlots(data.slots || []);
+  console.log(
+    `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${filled}/${capacity} | Daily:${getDailyMined(data)}/${getDailyLimit(data)}`
+  );
+}
+
+async function sellSilverBronzeAll(token, slots) {
+  // Prioritaskan data terbaru dari /api/character sebelum sell.
+  const charData = await fetchCharacter(token);
+  let totals = sumResources(charData?.slots || []);
+  if (!totals.silver && !totals.bronze) {
+    totals = sumResources(slots || []);
+  }
+
+  if (!totals.silver && !totals.bronze) {
+    console.log("[SELL] Tidak ada silver/bronze untuk dijual.");
+    return { ok: true, sold: false };
+  }
+
+  const payload = {
+    gold: 0,
+    silver: totals.silver,
+    bronze: totals.bronze
+  };
+
+  try {
+    const res = await fetch("/api/market/sell", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      console.log(`[SELL] Gagal (${res.status}): ${text}`);
+      return { ok: false, sold: false };
+    }
+
+    console.log(`[SELL] Berhasil jual silver=${payload.silver}, bronze=${payload.bronze}. Resp: ${text}`);
+    return { ok: true, sold: true };
+  } catch (err) {
+    console.log("[SELL] Network error:", err);
+    return { ok: false, sold: false };
+  }
+}
+
+async function maybeAutoSell(token, snapshot) {
+  const capacity = getCapacity(snapshot);
+  const slots = snapshot?.slots || [];
+  const filled = countFilledSlots(slots);
+  const freeSlots = Math.max(capacity - filled, 0);
+
+  if (capacity > 50) {
+    if (successCount < nextSellAt) return;
+    console.log(`[SELL] Trigger: ${successCount} mining sukses (capacity ${capacity}). Menjual silver+bronze...`);
+    const result = await sellSilverBronzeAll(token, slots);
+    if (result.ok) {
+      nextSellAt += SELL_EVERY_SUCCESS;
+    }
+    return;
+  }
+
+  if (freeSlots > LOW_CAPACITY_FREE_SLOT_TRIGGER) return;
+  if (successCount - lastNearFullSellAttemptAt < 3) return;
+
+  lastNearFullSellAttemptAt = successCount;
+  console.log(`[SELL] Trigger near-full (capacity ${capacity}, free ${freeSlots}). Menjual silver+bronze...`);
+  await sellSilverBronzeAll(token, slots);
+}
+
+function extractSnapshotFromMining(data) {
+  return {
+    character: data?.character || {},
+    slots: data?.slots || [],
+    dailyMinedToday: data?.dailyMinedToday,
+    dailyMiningLimit: data?.dailyMiningLimit,
+    capacity: data?.capacity
+  };
+}
+
+function isBackpackFull(snapshot) {
+  const capacity = getCapacity(snapshot);
+  if (!capacity) return false;
+  return countFilledSlots(snapshot?.slots || []) >= capacity;
+}
+
+function isDailyLimitReached(snapshot) {
+  const limit = getDailyLimit(snapshot);
+  if (!limit) return false;
+  return getDailyMined(snapshot) >= limit;
+}
+
+async function getLatestSnapshot(token, fallbackSnapshot) {
+  const latest = await fetchCharacter(token);
+  if (latest) return latest;
+  return fallbackSnapshot;
+}
+
+async function refreshCharacter(token) {
+  const data = await fetchCharacter(token);
+  if (!data) return null;
+  logCharacter(data);
+  return data;
+}
+
+async function evaluateLimitsOrStop(token, fallbackSnapshot) {
+  const latest = await getLatestSnapshot(token, fallbackSnapshot);
+  if (!latest) return;
+
+  if (isDailyLimitReached(latest)) {
+    stop("Daily limit reached");
+    return;
+  }
+
+  if (isBackpackFull(latest)) {
+    stop("Backpack full");
+    return;
+  }
+
+  logCharacter(latest);
+}
+
+async function hitLoop() {
+  if (!running) return;
+
+  const token = getToken();
+  if (!token) {
+    stop("Token tidak ditemukan di storage.");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/mining/hit", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        mapId: "map2",
+        rockIndex: rockIndex
+      })
+    });
+
+    if (!res.ok) {
+      console.log(`[HIT] Rock ${rockIndex} tidak bisa di-hit (${res.status})`);
+      invalidRocks.add(rockIndex);
+      nextRock();
+
+      if (invalidRocks.size >= (ROCK_MAX - ROCK_MIN + 1)) {
+        console.log("[WAIT] Semua batu 0-5 invalid. Tunggu 10 detik...");
+        invalidRocks.clear();
+        setTimeout(hitLoop, 10000);
+        return;
+      }
+
+      setTimeout(hitLoop, 1000);
+      return;
+    }
+
+    invalidRocks.delete(rockIndex);
+    const data = await res.json();
+
+    successCount += 1;
+    console.log(`[HIT] Sukses #${successCount} | Rock ${rockIndex} HP: ${data.rockHealthPct}`);
+
+    if (data.drop && data.drop.resourceType !== "nothing") {
+      console.log(`[DROP] +${data.drop.count} ${data.drop.resourceType}`);
+    }
+
+    const miningSnapshot = extractSnapshotFromMining(data);
+    await maybeAutoSell(token, miningSnapshot);
+    await evaluateLimitsOrStop(token, miningSnapshot);
+    if (!running) return;
+
+    if (data.rockHealthPct <= 0) {
+      console.log(`[ROCK] Rock ${rockIndex} destroyed`);
+      invalidRocks.add(rockIndex);
+      nextRock();
+    }
+
+  } catch (err) {
+    console.log("[ERR] Network error:", err);
+  }
+
+  setTimeout(hitLoop, getDelay());
+}
+
+async function startMining() {
+  const token = getToken();
+  if (!token) {
+    stop("Token tidak ditemukan di storage.");
+    return;
+  }
+
+  console.log("[START] Pre-sell silver+bronze sebelum mining...");
+  await sellSilverBronzeAll(token, null);
+  await refreshCharacter(token);
+
+  console.log("[START] Mining started (rock index 0-5)");
+  hitLoop();
+}
+
+startMining();
