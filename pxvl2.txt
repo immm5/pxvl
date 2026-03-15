@@ -1,0 +1,211 @@
+// =======================
+// CONFIG
+// =======================
+let MODE = "normal"; // normal / fast
+const ROCK_MIN = 0;
+const ROCK_MAX = 5;
+const SELL_EVERY_SUCCESS = 50;
+
+let running = true;
+let rockIndex = ROCK_MIN;
+let invalidRocks = new Set();
+let successCount = 0;
+let nextSellAt = SELL_EVERY_SUCCESS;
+
+function normalizeToken(raw) {
+  if (!raw) return "";
+  return String(raw).replace(/^Bearer\s+/i, "").trim();
+}
+
+function getToken() {
+  return normalizeToken(
+    localStorage.getItem("pixelvalley_token") ||
+    localStorage.getItem("token") ||
+    sessionStorage.getItem("pixelvalley_token")
+  );
+}
+
+function getDelay() {
+  if (MODE === "fast") {
+    return Math.floor(Math.random() * 500) + 1000; // 1 - 1.5 detik
+  }
+  return Math.floor(Math.random() * 2001) + 3000; // 3 - 5 detik
+}
+
+function stop(reason) {
+  console.log("[STOP]", reason);
+  running = false;
+}
+
+function nextRock() {
+  rockIndex++;
+  if (rockIndex > ROCK_MAX) rockIndex = ROCK_MIN;
+}
+
+function sumResources(slots = []) {
+  const totals = { gold: 0, silver: 0, bronze: 0 };
+  for (const s of slots) {
+    if (Object.prototype.hasOwnProperty.call(totals, s.resourceType)) {
+      totals[s.resourceType] += Number(s.count || 0);
+    }
+  }
+  return totals;
+}
+
+async function fetchCharacter(token) {
+  try {
+    const res = await fetch("/api/character", {
+      credentials: "include",
+      headers: {
+        "Authorization": `Bearer ${token}`
+      }
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function refreshCharacter(token) {
+  const data = await fetchCharacter(token);
+  if (!data) return;
+
+  const totals = sumResources(data.slots || []);
+  console.log(
+    `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Daily:${data.character?.dailyMinedToday ?? data.dailyMinedToday ?? 0}/${data.character?.dailyMiningLimit ?? data.dailyMiningLimit ?? 0}`
+  );
+}
+
+async function sellSilverBronzeAll(token, slots) {
+  let totals = sumResources(slots || []);
+
+  if (!totals.silver && !totals.bronze) {
+    const charData = await fetchCharacter(token);
+    totals = sumResources(charData?.slots || []);
+  }
+
+  if (!totals.silver && !totals.bronze) {
+    console.log("[SELL] Tidak ada silver/bronze untuk dijual.");
+    return true;
+  }
+
+  const payload = {
+    gold: 0,
+    silver: totals.silver,
+    bronze: totals.bronze
+  };
+
+  try {
+    const res = await fetch("/api/market/sell", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      console.log(`[SELL] Gagal (${res.status}): ${text}`);
+      return false;
+    }
+
+    console.log(`[SELL] Berhasil jual silver=${payload.silver}, bronze=${payload.bronze}. Resp: ${text}`);
+    return true;
+  } catch (err) {
+    console.log("[SELL] Network error:", err);
+    return false;
+  }
+}
+
+async function maybeAutoSell(token, slots) {
+  if (successCount < nextSellAt) return;
+
+  console.log(`[SELL] Trigger: ${successCount} mining sukses. Menjual semua silver+bronze...`);
+  const ok = await sellSilverBronzeAll(token, slots);
+  if (ok) {
+    nextSellAt += SELL_EVERY_SUCCESS;
+  }
+}
+
+async function hitLoop() {
+  if (!running) return;
+
+  const token = getToken();
+  if (!token) {
+    stop("Token tidak ditemukan di storage.");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/mining/hit", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        mapId: "map2",
+        rockIndex: rockIndex
+      })
+    });
+
+    if (!res.ok) {
+      console.log(`[HIT] Rock ${rockIndex} tidak bisa di-hit (${res.status})`);
+      invalidRocks.add(rockIndex);
+      nextRock();
+
+      if (invalidRocks.size >= (ROCK_MAX - ROCK_MIN + 1)) {
+        console.log("[WAIT] Semua batu 0-5 invalid. Tunggu 10 detik...");
+        invalidRocks.clear();
+        setTimeout(hitLoop, 10000);
+        return;
+      }
+
+      setTimeout(hitLoop, 1000);
+      return;
+    }
+
+    invalidRocks.delete(rockIndex);
+    const data = await res.json();
+
+    successCount += 1;
+    console.log(`[HIT] Sukses #${successCount} | Rock ${rockIndex} HP: ${data.rockHealthPct}`);
+
+    if (data.drop && data.drop.resourceType !== "nothing") {
+      console.log(`[DROP] +${data.drop.count} ${data.drop.resourceType}`);
+    }
+
+    await maybeAutoSell(token, data.slots);
+
+    if (data.character.dailyMinedToday >= data.character.dailyMiningLimit) {
+      stop("Daily limit reached");
+      return;
+    }
+
+    const filled = data.slots.filter(s => s.resourceType !== "empty");
+    if (filled.length >= data.character.capacity) {
+      stop("Backpack full");
+      return;
+    }
+
+    if (data.rockHealthPct <= 0) {
+      console.log(`[ROCK] Rock ${rockIndex} destroyed`);
+      invalidRocks.add(rockIndex);
+      nextRock();
+    }
+
+    await refreshCharacter(token);
+  } catch (err) {
+    console.log("[ERR] Network error:", err);
+  }
+
+  setTimeout(hitLoop, getDelay());
+}
+
+console.log("[START] Mining started (rock index 0-5)");
+hitLoop();
