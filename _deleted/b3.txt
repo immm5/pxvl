@@ -1,0 +1,336 @@
+(() => {
+  const CFG = {
+    startUrl: "https://pixelvalley.farm/api/arena/start",
+    wsBaseUrl: "wss://pixelvalley.farm/api/arena/ws",
+    token: null, // optional hardcode token; kalau null akan coba auto-detect lalu prompt
+    startPayload: {},
+    attackBurst: 16,
+    attackDelayMinMs: 44,
+    attackDelayMaxMs: 66,
+    betweenBurstMs: 120,
+    positionDelayMs: 60
+  };
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const now = () => new Date().toISOString().slice(11, 19);
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+  const state = {
+    stopped: false,
+    running: false,
+    activeSocket: null,
+    latestArena: null,
+    playerPos: null,
+    token: null,
+    runId: null
+  };
+
+  const log = (...args) => console.log(`[pvExpert3 ${now()}]`, ...args);
+  const warn = (...args) => console.warn(`[pvExpert3 ${now()}]`, ...args);
+
+  function parseNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function toPos(x, y) {
+    const px = parseNumber(x);
+    const py = parseNumber(y);
+    return px === null || py === null ? null : { x: px, y: py };
+  }
+
+  function extractPlayerPosFromState(data) {
+    const pairs = [
+      ["playerTileX", "playerTileY"],
+      ["playerGridX", "playerGridY"],
+      ["playerX", "playerY"],
+      ["gridX", "gridY"],
+      ["tileX", "tileY"]
+    ];
+    for (const [kx, ky] of pairs) {
+      const p = toPos(data?.[kx], data?.[ky]);
+      if (p) return p;
+    }
+
+    const nested = [data?.player, data?.position, data?.character];
+    for (const obj of nested) {
+      if (!obj || typeof obj !== "object") continue;
+      const p1 = toPos(obj.tileX, obj.tileY);
+      const p2 = toPos(obj.gridX, obj.gridY);
+      const p3 = toPos(obj.x, obj.y);
+      if (p1) return p1;
+      if (p2) return p2;
+      if (p3) return p3;
+    }
+    return null;
+  }
+
+  function updatePlayerPosFromState(data) {
+    const pos = extractPlayerPosFromState(data);
+    if (pos) state.playerPos = pos;
+  }
+
+  function parseIncoming(raw) {
+    try {
+      const data = typeof raw === "string" ? JSON.parse(raw) : JSON.parse(String(raw));
+      if (data && Array.isArray(data.monsters)) {
+        state.latestArena = data;
+        updatePlayerPosFromState(data);
+        runLoop();
+      }
+    } catch {
+      // ignore non-json frames
+    }
+  }
+
+  function getTokenFromStorage() {
+    const directKeys = [
+      "token",
+      "authToken",
+      "accessToken",
+      "pv_token",
+      "pixelvalley_token",
+      "bearer"
+    ];
+
+    for (const k of directKeys) {
+      const v1 = localStorage.getItem(k);
+      if (v1 && v1.length > 20) return v1.replace(/^Bearer\s+/i, "").trim();
+      const v2 = sessionStorage.getItem(k);
+      if (v2 && v2.length > 20) return v2.replace(/^Bearer\s+/i, "").trim();
+    }
+
+    const complexKeys = ["auth", "user", "session", "profile"];
+    for (const k of complexKeys) {
+      const raw = localStorage.getItem(k) || sessionStorage.getItem(k);
+      if (!raw) continue;
+      try {
+        const obj = JSON.parse(raw);
+        const token =
+          obj?.token ||
+          obj?.accessToken ||
+          obj?.authToken ||
+          obj?.jwt ||
+          obj?.data?.token ||
+          obj?.data?.accessToken;
+        if (token && String(token).length > 20) {
+          return String(token).replace(/^Bearer\s+/i, "").trim();
+        }
+      } catch {}
+    }
+
+    return null;
+  }
+
+  function resolveToken() {
+    if (CFG.token && String(CFG.token).trim()) {
+      return String(CFG.token).replace(/^Bearer\s+/i, "").trim();
+    }
+    const fromStorage = getTokenFromStorage();
+    if (fromStorage) return fromStorage;
+
+    const manual = prompt("Masukkan token Bearer Pixelvalley:");
+    if (!manual) return null;
+    return manual.replace(/^Bearer\s+/i, "").trim();
+  }
+
+  async function startArena(token) {
+    const resp = await fetch(CFG.startUrl, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "*/*",
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(CFG.startPayload ?? {})
+    });
+
+    const text = await resp.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch {}
+
+    if (!resp.ok) {
+      throw new Error(`start failed HTTP ${resp.status}: ${text.slice(0, 300)}`);
+    }
+    if (!data?.runId) {
+      throw new Error(`start ok tapi runId tidak ada: ${text.slice(0, 300)}`);
+    }
+    if (data.ok === false) {
+      throw new Error(`start response not ok: ${text.slice(0, 300)}`);
+    }
+    return data;
+  }
+
+  function buildWsUrl(token, runId) {
+    return `${CFG.wsBaseUrl}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
+  }
+
+  function connectWs(token, runId) {
+    return new Promise((resolve, reject) => {
+      const wsUrl = buildWsUrl(token, runId);
+      const ws = new WebSocket(wsUrl);
+      let settled = false;
+
+      const done = (ok, err) => {
+        if (settled) return;
+        settled = true;
+        if (ok) resolve(ws);
+        else reject(err || new Error("ws connect failed"));
+      };
+
+      ws.addEventListener("open", () => {
+        state.activeSocket = ws;
+        log("WS connected:", wsUrl);
+        done(true);
+      });
+      ws.addEventListener("message", (ev) => parseIncoming(ev.data));
+      ws.addEventListener("error", () => done(false, new Error("ws error")));
+      ws.addEventListener("close", (ev) => {
+        if (state.activeSocket === ws) {
+          state.activeSocket = null;
+        }
+        warn(`WS closed code=${ev.code} reason=${ev.reason || "-"}`);
+      });
+
+      setTimeout(() => done(false, new Error("ws open timeout")), 12000);
+    });
+  }
+
+  function getAliveMonsters() {
+    return (state.latestArena?.monsters ?? [])
+      .map((m, i) => ({ index: i, m }))
+      .filter(({ m }) => Number(m.hp) > 0);
+  }
+
+  function distanceToPlayer(monster) {
+    if (!state.playerPos) return Number.POSITIVE_INFINITY;
+    const mx = parseNumber(monster?.tileX);
+    const my = parseNumber(monster?.tileY);
+    if (mx === null || my === null) return Number.POSITIVE_INFINITY;
+    return Math.abs(mx - state.playerPos.x) + Math.abs(my - state.playerPos.y);
+  }
+
+  function pickNearestAliveMonster() {
+    const alive = getAliveMonsters();
+    if (!alive.length) return null;
+    if (!state.playerPos) return alive[0];
+    alive.sort((a, b) => distanceToPlayer(a.m) - distanceToPlayer(b.m));
+    return alive[0];
+  }
+
+  function send(obj) {
+    const ws = state.activeSocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(obj));
+    if (obj?.type === "position") {
+      const p = toPos(obj.gridX, obj.gridY);
+      if (p) state.playerPos = p;
+    }
+    return true;
+  }
+
+  async function runLoop() {
+    if (state.running || state.stopped) return;
+    state.running = true;
+
+    try {
+      while (!state.stopped) {
+        const nearest = pickNearestAliveMonster();
+        if (!nearest) {
+          await sleep(120);
+          continue;
+        }
+
+        const targetIndex = nearest.index;
+        const initialDist = distanceToPlayer(nearest.m);
+        log("Target nearest monster:", targetIndex, "distance:", initialDist);
+
+        while (!state.stopped) {
+          const target = state.latestArena?.monsters?.[targetIndex];
+          if (!target || Number(target.hp) <= 0) {
+            log("Monster mati:", targetIndex);
+            break;
+          }
+
+          if (!send({ type: "position", gridX: target.tileX, gridY: target.tileY })) {
+            warn("Socket tidak open saat kirim position.");
+            break;
+          }
+          await sleep(CFG.positionDelayMs);
+
+          for (let n = 0; n < CFG.attackBurst; n += 1) {
+            if (state.stopped) break;
+            const check = state.latestArena?.monsters?.[targetIndex];
+            if (!check || Number(check.hp) <= 0) break;
+            if (!send({ type: "attack", monsterIndex: targetIndex })) break;
+            await sleep(randInt(CFG.attackDelayMinMs, CFG.attackDelayMaxMs));
+          }
+
+          await sleep(CFG.betweenBurstMs);
+        }
+
+        if (!state.activeSocket || state.activeSocket.readyState !== WebSocket.OPEN) {
+          warn("Socket putus. Gunakan pvExpert3.restart() untuk start arena lagi.");
+          break;
+        }
+      }
+    } finally {
+      state.running = false;
+    }
+  }
+
+  async function restart() {
+    state.stopped = false;
+    if (state.activeSocket && state.activeSocket.readyState <= 1) {
+      try { state.activeSocket.close(); } catch {}
+      state.activeSocket = null;
+    }
+
+    const token = resolveToken();
+    if (!token) {
+      warn("Token tidak ditemukan.");
+      return false;
+    }
+
+    state.token = token;
+    log("Memanggil /api/arena/start ...");
+    const startData = await startArena(token);
+
+    state.runId = startData.runId;
+    state.latestArena = startData;
+    updatePlayerPosFromState(startData);
+    log("Arena started. runId:", state.runId);
+
+    await connectWs(token, state.runId);
+    runLoop();
+    return true;
+  }
+
+  function stop() {
+    state.stopped = true;
+    if (state.activeSocket && state.activeSocket.readyState <= 1) {
+      try { state.activeSocket.close(); } catch {}
+    }
+    state.activeSocket = null;
+    log("Stopped.");
+  }
+
+  window.pvExpert3 = {
+    restart,
+    stop,
+    send,
+    state: () => state.latestArena,
+    status: () => ({
+      running: state.running,
+      stopped: state.stopped,
+      tokenLoaded: Boolean(state.token),
+      runId: state.runId,
+      playerPos: state.playerPos,
+      activeSocketReadyState: state.activeSocket?.readyState ?? null,
+      activeSocketUrl: state.activeSocket?.url ?? null
+    })
+  };
+
+  log("Ready. Jalankan: pvExpert3.restart()");
+})();

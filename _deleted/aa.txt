@@ -1,0 +1,95 @@
+(() => {
+  const WS_URL = "wss://pixelvalley.farm/api/arena/ws?token=7e5da34d7c1c970b46c4fe720c98a4aefc745a6fd205da90d2033be2219f5ef6&runId=e06c61fa-dc46-465b-bd92-b958fda3eb1b";
+  const ATTACK_BURST = 18;
+  const ATTACK_DELAY_MS = 66;
+  const BETWEEN_TARGET_MS = 55;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const ws = new WebSocket(WS_URL);
+  let latestState = null;
+  let running = false;
+  let stopped = false;
+
+  const send = (obj) => {
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(obj));
+    console.log(">>", obj);
+    return true;
+  };
+
+  const aliveMonsters = (state) =>
+    (state?.monsters ?? [])
+      .map((m, i) => ({ i, m }))
+      .filter(({ m }) => Number(m.hp) > 0);
+
+  async function runLoop() {
+    if (running || stopped || !latestState) return;
+    running = true;
+    try {
+      while (!stopped) {
+        const alive = aliveMonsters(latestState);
+        if (alive.length === 0) break;
+
+        for (const { i, m } of alive) {
+          if (stopped) break;
+          if (Number(m.hp) <= 0) continue;
+
+          send({ type: "position", gridX: m.tileX, gridY: m.tileY });
+          await sleep(60);
+
+          for (let n = 0; n < ATTACK_BURST; n++) {
+            if (stopped) break;
+            send({ type: "attack", monsterIndex: i });
+            await sleep(ATTACK_DELAY_MS);
+          }
+
+          await sleep(BETWEEN_TARGET_MS);
+        }
+
+        await sleep(120);
+      }
+    } finally {
+      running = false;
+    }
+  }
+
+  ws.onopen = () => console.log("[pvBot] WS connected");
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+
+      if (Array.isArray(data.monsters)) {
+        latestState = data;
+        runLoop();
+      } else {
+        console.log("<<", data);
+      }
+    } catch {
+      console.log("<< raw", ev.data);
+    }
+  };
+  ws.onerror = (e) => console.error("[pvBot] WS error", e);
+  ws.onclose = (ev) => console.log("[pvBot] WS closed", ev.code, ev.reason);
+
+  window.pvBot = {
+    stop() {
+      stopped = true;
+      try { ws.close(); } catch {}
+      console.log("[pvBot] stopped");
+    },
+    resume() {
+      stopped = false;
+      runLoop();
+    },
+    send(obj) {
+      return send(obj);
+    },
+    state() {
+      return latestState;
+    },
+    ws
+  };
+
+  console.log("[pvBot] ready. command: pvBot.stop()");
+})();

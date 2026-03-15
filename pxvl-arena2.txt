@@ -1,0 +1,637 @@
+(() => {
+  if (window.pvArena2) {
+    console.warn("pvArena2 already loaded.");
+    return;
+  }
+
+  const CFG = {
+    startPath: "/api/arena/start",
+    startTimeoutMs: 15000,
+    wsPath: "/api/arena/ws",
+    wsHostPattern: "pixelvalley",
+    autoStartOnLoad: true,
+    autoDailyEnabled: true,
+    restartDelayMinMs: 15000,
+    restartDelayMaxMs: 20000,
+    maxAutoRestarts: 12,
+    initialPosition: { gridX: 10, gridY: 9 },
+    attackBurst: 16,
+    attackDelayMinMs: 44,
+    attackDelayMaxMs: 66,
+    betweenBurstMs: 120,
+    positionDelayMs: 60,
+    acquireTimeoutMs: 8000
+  };
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const now = () => new Date().toISOString().slice(11, 19);
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const extractTokenFromUrl = (url) => {
+    if (!url || typeof url !== "string") return null;
+    try {
+      const u = new URL(url, location.origin);
+      const t = u.searchParams.get("token");
+      return t || null;
+    } catch {
+      return null;
+    }
+  };
+  const safeJson = (raw) => {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  };
+
+  const state = {
+    stopped: false,
+    running: false,
+    activeSocket: null,
+    latestArena: null,
+    playerPos: null,
+    installed: false,
+    token: null,
+    runId: null,
+    lastWsUrl: null,
+    lastStart: null,
+    battlesLeft: null,
+    maxBattlesPerDay: null,
+    autoDailyEnabled: CFG.autoDailyEnabled,
+    autoRestarting: false,
+    autoRestartCount: 0,
+    startInFlight: false,
+    socketGeneration: 0
+  };
+
+  const orig = {
+    WebSocket: window.WebSocket,
+    send: WebSocket.prototype.send
+  };
+
+  const log = (...args) => console.log(`[pvArena2 ${now()}]`, ...args);
+  const warn = (...args) => console.warn(`[pvArena2 ${now()}]`, ...args);
+
+  const wsOrigin = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
+  const isArenaUrl = (url) => {
+    if (typeof url !== "string") return false;
+    const lower = url.toLowerCase();
+    return lower.startsWith("ws") && lower.includes(CFG.wsPath) && lower.includes(CFG.wsHostPattern);
+  };
+
+  const parseNumber = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const toPos = (x, y) => {
+    const px = parseNumber(x);
+    const py = parseNumber(y);
+    return px === null || py === null ? null : { x: px, y: py };
+  };
+
+  const extractPlayerPosFromState = (data) => {
+    const pairs = [
+      ["playerTileX", "playerTileY"],
+      ["playerGridX", "playerGridY"],
+      ["playerX", "playerY"],
+      ["gridX", "gridY"],
+      ["tileX", "tileY"]
+    ];
+
+    for (const [kx, ky] of pairs) {
+      const p = toPos(data?.[kx], data?.[ky]);
+      if (p) return p;
+    }
+
+    const nested = [data?.player, data?.position, data?.character];
+    for (const obj of nested) {
+      if (!obj || typeof obj !== "object") continue;
+      const p1 = toPos(obj.tileX, obj.tileY);
+      const p2 = toPos(obj.gridX, obj.gridY);
+      const p3 = toPos(obj.x, obj.y);
+      if (p1) return p1;
+      if (p2) return p2;
+      if (p3) return p3;
+    }
+
+    return null;
+  };
+
+  const updatePlayerPosFromState = (data) => {
+    const pos = extractPlayerPosFromState(data);
+    if (pos) state.playerPos = pos;
+  };
+
+  const parseIncoming = (raw) => {
+    const data = safeJson(typeof raw === "string" ? raw : String(raw));
+    if (!data || typeof data !== "object") return;
+
+    if (Array.isArray(data.monsters)) {
+      state.latestArena = data;
+      updatePlayerPosFromState(data);
+      runLoop();
+    }
+  };
+
+  const attachArenaSocket = (ws, source) => {
+    if (!ws || ws.__pvArena2Attached) return;
+    ws.__pvArena2Attached = true;
+    ws.__pvArena2InitPosSent = false;
+    ws.__pvArena2SocketGeneration = ++state.socketGeneration;
+    state.activeSocket = ws;
+
+    ws.addEventListener("message", (ev) => parseIncoming(ev.data));
+    ws.addEventListener("close", (ev) => {
+      if (state.activeSocket === ws) state.activeSocket = null;
+      state.socketGeneration += 1;
+      state.running = false;
+      log("WSS close:", ev?.code ?? "?", ev?.reason || "(no reason)");
+      if (!ws.__pvArena2SkipRestart) {
+        maybeAutoRestartAfterClose(ev);
+      }
+    });
+    ws.addEventListener("error", (ev) => warn("Arena socket error:", ev));
+
+    log(`Arena socket attached from ${source}:`, ws.url);
+  };
+
+  const setAutoDaily = (enabled) => {
+    state.autoDailyEnabled = Boolean(enabled);
+    log("Auto daily:", state.autoDailyEnabled ? "ON" : "OFF");
+    return state.autoDailyEnabled;
+  };
+
+  const maybeAutoRestartAfterClose = async (_ev) => {
+    if (!state.autoDailyEnabled) return;
+    if (state.stopped) return;
+    if (state.autoRestarting) return;
+    if (state.startInFlight) return;
+
+    const left = Number(state.battlesLeft);
+    if (Number.isFinite(left) && left <= 0) {
+      log("Daily battles exhausted (battlesLeft=0). Auto stop.");
+      return;
+    }
+
+    if (state.autoRestartCount >= CFG.maxAutoRestarts) {
+      warn(`Auto restart limit reached (${CFG.maxAutoRestarts}). Auto stop.`);
+      return;
+    }
+
+    state.autoRestarting = true;
+    state.autoRestartCount += 1;
+    const waitMs = randInt(CFG.restartDelayMinMs, CFG.restartDelayMaxMs);
+    log(`Auto restart #${state.autoRestartCount} in ${waitMs}ms...`);
+    await sleep(waitMs);
+
+    try {
+      if (state.stopped) return;
+      const result = await startArena({ autoConnect: true });
+      if (!result?.ok) {
+        warn("Auto restart start() failed:", result);
+      }
+    } catch (e) {
+      warn("Auto restart error:", e?.message || e);
+    } finally {
+      state.autoRestarting = false;
+    }
+  };
+
+  const sendInitialPositionOnce = () => {
+    const ws = state.activeSocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (ws.__pvArena2InitPosSent) return true;
+
+    const initPos = {
+      type: "position",
+      gridX: CFG.initialPosition.gridX,
+      gridY: CFG.initialPosition.gridY
+    };
+
+    try {
+      ws.send(JSON.stringify(initPos));
+      ws.__pvArena2InitPosSent = true;
+      state.playerPos = { x: initPos.gridX, y: initPos.gridY };
+      log("Initial position sent once:", initPos);
+      return true;
+    } catch (e) {
+      warn("Gagal kirim initial position:", e);
+      return false;
+    }
+  };
+
+  const installHooks = () => {
+    if (state.installed) return;
+    state.installed = true;
+
+    WebSocket.prototype.send = function patchedSend(data) {
+      try {
+        if (isArenaUrl(this.url)) {
+          attachArenaSocket(this, "prototype.send");
+        }
+
+        if (typeof data === "string") {
+          const parsed = JSON.parse(data);
+          if (parsed?.type === "position") {
+            const p = toPos(parsed.gridX, parsed.gridY);
+            if (p) state.playerPos = p;
+          }
+        }
+      } catch {}
+      return orig.send.call(this, data);
+    };
+
+    const NativeWS = window.WebSocket;
+    function PatchedWebSocket(url, protocols) {
+      const ws = protocols === undefined ? new NativeWS(url) : new NativeWS(url, protocols);
+      try {
+        if (isArenaUrl(ws.url || url)) attachArenaSocket(ws, "constructor");
+      } catch {}
+      return ws;
+    }
+
+    PatchedWebSocket.prototype = NativeWS.prototype;
+    Object.setPrototypeOf(PatchedWebSocket, NativeWS);
+    window.WebSocket = PatchedWebSocket;
+  };
+
+  const buildWsUrl = (token, runId) =>
+    `${wsOrigin()}${CFG.wsPath}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
+
+  const setToken = (token) => {
+    state.token = token;
+    return token;
+  };
+
+  const isLikelyToken = (value) => {
+    if (typeof value !== "string") return false;
+    const v = value.trim();
+    if (!v || v.length < 20) return false;
+    if (/\s/.test(v)) return false;
+    return true;
+  };
+
+  const maybeTokenFromValue = (value) => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (isLikelyToken(trimmed)) return trimmed;
+    if (/^bearer\s+/i.test(trimmed)) {
+      const t = trimmed.replace(/^bearer\s+/i, "").trim();
+      if (isLikelyToken(t)) return t;
+    }
+    return null;
+  };
+
+  const scanStorageForToken = (storage) => {
+    if (!storage) return null;
+    const keyHints = ["token", "auth", "access", "bearer", "jwt", "session"];
+    const objHints = ["token", "accessToken", "authToken", "bearer", "authorization"];
+    for (let i = 0; i < storage.length; i += 1) {
+      const key = storage.key(i);
+      if (!key) continue;
+      let value = "";
+      try {
+        value = storage.getItem(key) ?? "";
+      } catch {
+        continue;
+      }
+
+      const direct = maybeTokenFromValue(value);
+      if (direct && keyHints.some((h) => key.toLowerCase().includes(h))) return direct;
+
+      if (value.startsWith("{") || value.startsWith("[")) {
+        const parsed = safeJson(value);
+        if (parsed && typeof parsed === "object") {
+          for (const hint of objHints) {
+            const nested = parsed?.[hint];
+            const token = maybeTokenFromValue(typeof nested === "string" ? nested : "");
+            if (token) return token;
+          }
+        }
+      }
+    }
+    return null;
+  };
+
+  const scanCookieForToken = () => {
+    let raw = "";
+    try {
+      raw = document.cookie || "";
+    } catch {
+      return null;
+    }
+    if (!raw) return null;
+
+    const keyHints = ["token", "auth", "access", "bearer", "session"];
+    const parts = raw.split(";").map((s) => s.trim()).filter(Boolean);
+    for (const part of parts) {
+      const idx = part.indexOf("=");
+      if (idx < 1) continue;
+      const key = decodeURIComponent(part.slice(0, idx)).toLowerCase();
+      const value = decodeURIComponent(part.slice(idx + 1));
+      if (!keyHints.some((h) => key.includes(h))) continue;
+      const token = maybeTokenFromValue(value);
+      if (token) return token;
+    }
+    return null;
+  };
+
+  const detectToken = () => {
+    if (isLikelyToken(state.token)) return { token: state.token, source: "state.token" };
+
+    const urlToken = extractTokenFromUrl(state.activeSocket?.url) || extractTokenFromUrl(state.lastWsUrl);
+    if (isLikelyToken(urlToken)) return { token: urlToken, source: "wsUrl" };
+
+    try {
+      const perf = performance.getEntriesByType("resource") || [];
+      for (let i = perf.length - 1; i >= 0; i -= 1) {
+        const name = perf[i]?.name;
+        if (!name || !name.includes(CFG.wsPath)) continue;
+        const t = extractTokenFromUrl(name);
+        if (isLikelyToken(t)) return { token: t, source: "performance.ws" };
+      }
+    } catch {}
+
+    const lsToken = scanStorageForToken(window.localStorage);
+    if (isLikelyToken(lsToken)) return { token: lsToken, source: "localStorage" };
+
+    const ssToken = scanStorageForToken(window.sessionStorage);
+    if (isLikelyToken(ssToken)) return { token: ssToken, source: "sessionStorage" };
+
+    const cookieToken = scanCookieForToken();
+    if (isLikelyToken(cookieToken)) return { token: cookieToken, source: "cookie(non-HttpOnly)" };
+
+    return { token: null, source: null };
+  };
+
+  const startArena = async ({ token, autoConnect = true } = {}) => {
+    if (state.startInFlight) {
+      warn("start() masih berjalan. Tunggu selesai dulu.");
+      return state.lastStart;
+    }
+
+    const detected = detectToken();
+    const finalToken = token || detected.token;
+    if (!finalToken) {
+      throw new Error("Token kosong. Pakai pvArena2.setToken('TOKEN') dulu.");
+    }
+    if (!token && detected.source) {
+      log(`Token auto-detected from ${detected.source}`);
+    }
+
+    log(`Start request -> ${CFG.startPath} (timeout ${CFG.startTimeoutMs}ms)`);
+    state.startInFlight = true;
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), CFG.startTimeoutMs);
+      let res;
+
+      try {
+        res = await fetch(CFG.startPath, {
+          method: "POST",
+          headers: {
+            accept: "*/*",
+            "content-type": "application/json",
+            authorization: `Bearer ${finalToken}`
+          },
+          credentials: "include",
+          body: "{}",
+          signal: controller.signal
+        });
+      } catch (err) {
+        const msg = err?.name === "AbortError"
+          ? `Start timeout > ${CFG.startTimeoutMs}ms`
+          : `Start fetch error: ${err?.message || String(err)}`;
+        state.lastStart = {
+          time: new Date().toISOString(),
+          status: null,
+          ok: false,
+          error: msg
+        };
+        warn(msg);
+        return state.lastStart;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      log("Start response status:", res.status);
+
+      const text = await res.text();
+      const data = safeJson(text);
+
+      state.lastStart = {
+        time: new Date().toISOString(),
+        status: res.status,
+        ok: res.ok,
+        data
+      };
+
+      if (!res.ok || !data || typeof data !== "object" || !data.runId) {
+        warn("Start gagal / runId tidak ada:", state.lastStart);
+        return state.lastStart;
+      }
+
+      state.token = finalToken;
+      state.runId = data.runId;
+      state.battlesLeft = Number.isFinite(Number(data.battlesLeft)) ? Number(data.battlesLeft) : null;
+      state.maxBattlesPerDay = Number.isFinite(Number(data.maxBattlesPerDay)) ? Number(data.maxBattlesPerDay) : null;
+      state.lastWsUrl = buildWsUrl(finalToken, data.runId);
+      log("Start OK. runId:", state.runId);
+      log("WSS URL:", state.lastWsUrl);
+      if (typeof data.battlesLeft !== "undefined") {
+        log("Battles left:", data.battlesLeft);
+      }
+
+      if (autoConnect) connect(state.lastWsUrl);
+      return {
+        ...state.lastStart,
+        runId: state.runId,
+        wsUrl: state.lastWsUrl
+      };
+    } finally {
+      state.startInFlight = false;
+    }
+  };
+
+  const connect = (wsUrl) => {
+    const url = wsUrl || state.lastWsUrl || (state.token && state.runId ? buildWsUrl(state.token, state.runId) : null);
+    if (!url) throw new Error("WSS URL kosong. Jalankan pvArena2.start() dulu.");
+
+    if (state.activeSocket && state.activeSocket.readyState <= 1) {
+      try {
+        state.activeSocket.__pvArena2SkipRestart = true;
+        state.activeSocket.close();
+      } catch {}
+    }
+
+    const ws = new orig.WebSocket(url);
+    ws.addEventListener("open", () => {
+      attachArenaSocket(ws, "manual.connect");
+      log("WSS open:", url);
+      sendInitialPositionOnce();
+      runLoop();
+    });
+    return ws;
+  };
+
+  const getAliveMonsters = () =>
+    (state.latestArena?.monsters ?? [])
+      .map((m, i) => ({ index: i, m }))
+      .filter(({ m }) => Number(m.hp) > 0);
+
+  const distanceToPlayer = (monster) => {
+    if (!state.playerPos) return Number.POSITIVE_INFINITY;
+    const mx = parseNumber(monster?.tileX);
+    const my = parseNumber(monster?.tileY);
+    if (mx === null || my === null) return Number.POSITIVE_INFINITY;
+    return Math.abs(mx - state.playerPos.x) + Math.abs(my - state.playerPos.y);
+  };
+
+  const pickNearestAliveMonster = () => {
+    const alive = getAliveMonsters();
+    if (!alive.length) return null;
+    if (!state.playerPos) return alive[0];
+    alive.sort((a, b) => distanceToPlayer(a.m) - distanceToPlayer(b.m));
+    return alive[0];
+  };
+
+  const send = (obj) => {
+    const ws = state.activeSocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(obj));
+    if (obj?.type === "position") {
+      const p = toPos(obj.gridX, obj.gridY);
+      if (p) state.playerPos = p;
+    }
+    return true;
+  };
+
+  const acquireSocket = async () => {
+    const start = Date.now();
+    while (!state.stopped && Date.now() - start < CFG.acquireTimeoutMs) {
+      if (state.activeSocket && state.activeSocket.readyState === WebSocket.OPEN) {
+        sendInitialPositionOnce();
+        return true;
+      }
+      await sleep(250);
+    }
+    return false;
+  };
+
+  async function runLoop() {
+    if (state.running || state.stopped) return;
+    state.running = true;
+    const loopSocketGeneration = state.activeSocket?.__pvArena2SocketGeneration ?? state.socketGeneration;
+
+    try {
+      const ok = await acquireSocket();
+      if (!ok) {
+        warn("Socket arena belum open. Jalankan pvArena2.start() atau pvArena2.connect().");
+        return;
+      }
+
+      while (!state.stopped && loopSocketGeneration === state.socketGeneration) {
+        const nearest = pickNearestAliveMonster();
+        if (!nearest) {
+          await sleep(120);
+          continue;
+        }
+
+        const targetIndex = nearest.index;
+        while (!state.stopped && loopSocketGeneration === state.socketGeneration) {
+          const target = state.latestArena?.monsters?.[targetIndex];
+          if (!target || Number(target.hp) <= 0) break;
+
+          if (!send({ type: "position", gridX: target.tileX, gridY: target.tileY })) {
+            if (loopSocketGeneration !== state.socketGeneration) break;
+            await sleep(300);
+            continue;
+          }
+          await sleep(CFG.positionDelayMs);
+
+          for (let n = 0; n < CFG.attackBurst; n += 1) {
+            if (state.stopped) break;
+            const check = state.latestArena?.monsters?.[targetIndex];
+            if (!check || Number(check.hp) <= 0) break;
+            if (!send({ type: "attack", monsterIndex: targetIndex })) break;
+            await sleep(randInt(CFG.attackDelayMinMs, CFG.attackDelayMaxMs));
+          }
+
+          await sleep(CFG.betweenBurstMs);
+        }
+      }
+    } finally {
+      state.running = false;
+    }
+  }
+
+  const stop = () => {
+    state.stopped = true;
+    log("Stopped.");
+  };
+
+  const resume = () => {
+    if (!state.stopped) return;
+    state.stopped = false;
+    runLoop();
+  };
+
+  const autoStart = async () => {
+    try {
+      log("Auto start on load...");
+      const result = await startArena({ autoConnect: true });
+      if (!result?.ok) {
+        warn("Auto start gagal:", result);
+      }
+      return result;
+    } catch (e) {
+      warn("Auto start error:", e?.message || e);
+      return null;
+    }
+  };
+
+  installHooks();
+
+  window.pvArena2 = {
+    setToken,
+    setAutoDaily,
+    detectToken,
+    start: startArena,
+    connect,
+    autoStart,
+    stop,
+    resume,
+    send,
+    wsUrl: () => state.lastWsUrl,
+    lastStart: () => state.lastStart,
+    status: () => ({
+      running: state.running,
+      stopped: state.stopped,
+      tokenSet: Boolean(state.token),
+      runId: state.runId,
+      battlesLeft: state.battlesLeft,
+      maxBattlesPerDay: state.maxBattlesPerDay,
+      playerPos: state.playerPos,
+      autoDailyEnabled: state.autoDailyEnabled,
+      autoRestarting: state.autoRestarting,
+      autoRestartCount: state.autoRestartCount,
+      startInFlight: state.startInFlight,
+      activeSocketUrl: state.activeSocket?.url ?? null,
+      activeSocketReadyState: state.activeSocket?.readyState ?? null
+    }),
+    state: () => state.latestArena
+  };
+
+  log("Ready.");
+  log("Use:");
+  log("1) script ini auto start saat load");
+  log("2) pvArena2.setAutoDaily(false)  // matikan auto restart");
+  log("3) pvArena2.status()");
+  log("4) pvArena2.autoStart()  // trigger manual kalau perlu");
+
+  if (CFG.autoStartOnLoad) {
+    autoStart();
+  }
+})();
