@@ -1,0 +1,988 @@
+(() => {
+  if (window.pvDaily) {
+    console.warn("pvDaily already loaded.");
+    return;
+  }
+
+  const CFG = {
+    autoRunOnLoad: true,
+    betweenArenaAndMiningMs: 60_000,
+    arena: {
+      startPath: "/api/arena/start",
+      startTimeoutMs: 15_000,
+      wsPath: "/api/arena/ws",
+      wsHostPattern: "pixelvalley",
+      restartDelayMinMs: 25_000,
+      restartDelayMaxMs: 35_000,
+      maxAutoRestarts: 20,
+      initialPosition: { gridX: 10, gridY: 9 },
+      attackBurst: 16,
+      attackDelayMinMs: 44,
+      attackDelayMaxMs: 66,
+      betweenBurstMs: 120,
+      positionDelayMs: 60,
+      acquireTimeoutMs: 8_000
+    },
+    mining: {
+      mode: "normal", // normal / fast
+      rockMin: 0,
+      rockMax: 5,
+      sellEverySuccess: 50,
+      lowCapacityFreeSlotTrigger: 4
+    }
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const now = () => new Date().toISOString().slice(11, 19);
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const safeJson = (raw) => {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  };
+
+  const baseLog = (...args) => console.log(`[pvDaily ${now()}]`, ...args);
+  const baseWarn = (...args) => console.warn(`[pvDaily ${now()}]`, ...args);
+
+  const extractTokenFromUrl = (url) => {
+    if (!url || typeof url !== "string") return null;
+    try {
+      const u = new URL(url, location.origin);
+      const t = u.searchParams.get("token");
+      return t || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const normalizeToken = (raw) => {
+    if (!raw) return "";
+    return String(raw).replace(/^Bearer\s+/i, "").trim();
+  };
+
+  const isLikelyToken = (value) => {
+    if (typeof value !== "string") return false;
+    const v = value.trim();
+    if (!v || v.length < 20) return false;
+    if (/\s/.test(v)) return false;
+    return true;
+  };
+
+  const maybeTokenFromValue = (value) => {
+    const normalized = normalizeToken(value);
+    return isLikelyToken(normalized) ? normalized : null;
+  };
+
+  const scanStorageForToken = (storage) => {
+    if (!storage) return null;
+    const keyHints = ["token", "auth", "access", "bearer", "jwt", "session", "pixelvalley"];
+    const objHints = ["token", "accessToken", "authToken", "bearer", "authorization"];
+
+    for (let i = 0; i < storage.length; i += 1) {
+      const key = storage.key(i);
+      if (!key) continue;
+
+      let value = "";
+      try {
+        value = storage.getItem(key) ?? "";
+      } catch {
+        continue;
+      }
+
+      const direct = maybeTokenFromValue(value);
+      if (direct && keyHints.some((h) => key.toLowerCase().includes(h))) {
+        return direct;
+      }
+
+      if (value.startsWith("{") || value.startsWith("[")) {
+        const parsed = safeJson(value);
+        if (parsed && typeof parsed === "object") {
+          for (const hint of objHints) {
+            const nested = parsed?.[hint];
+            const token = maybeTokenFromValue(typeof nested === "string" ? nested : "");
+            if (token) return token;
+          }
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const scanCookieForToken = () => {
+    let raw = "";
+    try {
+      raw = document.cookie || "";
+    } catch {
+      return null;
+    }
+    if (!raw) return null;
+
+    const keyHints = ["token", "auth", "access", "bearer", "session"];
+    const parts = raw.split(";").map((s) => s.trim()).filter(Boolean);
+    for (const part of parts) {
+      const idx = part.indexOf("=");
+      if (idx < 1) continue;
+      const key = decodeURIComponent(part.slice(0, idx)).toLowerCase();
+      const value = decodeURIComponent(part.slice(idx + 1));
+      if (!keyHints.some((h) => key.includes(h))) continue;
+      const token = maybeTokenFromValue(value);
+      if (token) return token;
+    }
+
+    return null;
+  };
+
+  const detectToken = ({ activeWsUrl = null, lastWsUrl = null } = {}) => {
+    const urlToken = extractTokenFromUrl(activeWsUrl) || extractTokenFromUrl(lastWsUrl);
+    if (isLikelyToken(urlToken)) return { token: urlToken, source: "wsUrl" };
+
+    try {
+      const perf = performance.getEntriesByType("resource") || [];
+      for (let i = perf.length - 1; i >= 0; i -= 1) {
+        const name = perf[i]?.name;
+        if (!name) continue;
+        const token = extractTokenFromUrl(name);
+        if (isLikelyToken(token)) return { token, source: "performance" };
+      }
+    } catch {}
+
+    const lsToken = scanStorageForToken(window.localStorage);
+    if (isLikelyToken(lsToken)) return { token: lsToken, source: "localStorage" };
+
+    const ssToken = scanStorageForToken(window.sessionStorage);
+    if (isLikelyToken(ssToken)) return { token: ssToken, source: "sessionStorage" };
+
+    const cookieToken = scanCookieForToken();
+    if (isLikelyToken(cookieToken)) return { token: cookieToken, source: "cookie(non-HttpOnly)" };
+
+    return { token: null, source: null };
+  };
+
+  function createArenaModule() {
+    const cfg = CFG.arena;
+    const wsOrigin = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
+    const log = (...args) => baseLog("[Arena]", ...args);
+    const warn = (...args) => baseWarn("[Arena]", ...args);
+
+    const state = {
+      stopped: false,
+      runningLoop: false,
+      activeSocket: null,
+      latestArena: null,
+      playerPos: null,
+      token: null,
+      runId: null,
+      lastWsUrl: null,
+      lastStart: null,
+      battlesLeft: null,
+      maxBattlesPerDay: null,
+      autoRestarting: false,
+      autoRestartCount: 0,
+      startInFlight: false,
+      dailyInProgress: false,
+      dailyPromise: null,
+      dailyResolve: null
+    };
+
+    const parseNumber = (value) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const toPos = (x, y) => {
+      const px = parseNumber(x);
+      const py = parseNumber(y);
+      return px === null || py === null ? null : { x: px, y: py };
+    };
+
+    const extractPlayerPosFromState = (data) => {
+      const pairs = [
+        ["playerTileX", "playerTileY"],
+        ["playerGridX", "playerGridY"],
+        ["playerX", "playerY"],
+        ["gridX", "gridY"],
+        ["tileX", "tileY"]
+      ];
+
+      for (const [kx, ky] of pairs) {
+        const p = toPos(data?.[kx], data?.[ky]);
+        if (p) return p;
+      }
+
+      const nested = [data?.player, data?.position, data?.character];
+      for (const obj of nested) {
+        if (!obj || typeof obj !== "object") continue;
+        const p1 = toPos(obj.tileX, obj.tileY);
+        const p2 = toPos(obj.gridX, obj.gridY);
+        const p3 = toPos(obj.x, obj.y);
+        if (p1) return p1;
+        if (p2) return p2;
+        if (p3) return p3;
+      }
+
+      return null;
+    };
+
+    const updatePlayerPosFromState = (data) => {
+      const pos = extractPlayerPosFromState(data);
+      if (pos) state.playerPos = pos;
+    };
+
+    const parseIncoming = (raw) => {
+      const data = safeJson(typeof raw === "string" ? raw : String(raw));
+      if (!data || typeof data !== "object") return;
+      if (Array.isArray(data.monsters)) {
+        state.latestArena = data;
+        updatePlayerPosFromState(data);
+        runLoop();
+      }
+    };
+
+    const send = (obj) => {
+      const ws = state.activeSocket;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify(obj));
+      if (obj?.type === "position") {
+        const p = toPos(obj.gridX, obj.gridY);
+        if (p) state.playerPos = p;
+      }
+      return true;
+    };
+
+    const sendInitialPositionOnce = () => {
+      const ws = state.activeSocket;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      if (ws.__pvDailyInitPosSent) return true;
+
+      const initPos = {
+        type: "position",
+        gridX: cfg.initialPosition.gridX,
+        gridY: cfg.initialPosition.gridY
+      };
+
+      try {
+        ws.send(JSON.stringify(initPos));
+        ws.__pvDailyInitPosSent = true;
+        state.playerPos = { x: initPos.gridX, y: initPos.gridY };
+        log("Initial position sent once:", initPos);
+        return true;
+      } catch (e) {
+        warn("Failed to send initial position:", e);
+        return false;
+      }
+    };
+
+    const getAliveMonsters = () =>
+      (state.latestArena?.monsters ?? [])
+        .map((m, i) => ({ index: i, m }))
+        .filter(({ m }) => Number(m.hp) > 0);
+
+    const distanceToPlayer = (monster) => {
+      if (!state.playerPos) return Number.POSITIVE_INFINITY;
+      const mx = parseNumber(monster?.tileX);
+      const my = parseNumber(monster?.tileY);
+      if (mx === null || my === null) return Number.POSITIVE_INFINITY;
+      return Math.abs(mx - state.playerPos.x) + Math.abs(my - state.playerPos.y);
+    };
+
+    const pickNearestAliveMonster = () => {
+      const alive = getAliveMonsters();
+      if (!alive.length) return null;
+      if (!state.playerPos) return alive[0];
+      alive.sort((a, b) => distanceToPlayer(a.m) - distanceToPlayer(b.m));
+      return alive[0];
+    };
+
+    const acquireSocket = async () => {
+      const startAt = Date.now();
+      while (!state.stopped && Date.now() - startAt < cfg.acquireTimeoutMs) {
+        if (state.activeSocket && state.activeSocket.readyState === WebSocket.OPEN) {
+          sendInitialPositionOnce();
+          return true;
+        }
+        await sleep(250);
+      }
+      return false;
+    };
+
+    async function runLoop() {
+      if (state.runningLoop || state.stopped) return;
+      state.runningLoop = true;
+      const loopSocket = state.activeSocket;
+
+      try {
+        const ok = await acquireSocket();
+        if (!ok) return;
+
+        while (!state.stopped && loopSocket === state.activeSocket && loopSocket?.readyState === WebSocket.OPEN) {
+          const nearest = pickNearestAliveMonster();
+          if (!nearest) {
+            await sleep(120);
+            continue;
+          }
+
+          const targetIndex = nearest.index;
+          while (!state.stopped && loopSocket === state.activeSocket && loopSocket?.readyState === WebSocket.OPEN) {
+            const target = state.latestArena?.monsters?.[targetIndex];
+            if (!target || Number(target.hp) <= 0) break;
+
+            if (!send({ type: "position", gridX: target.tileX, gridY: target.tileY })) {
+              await sleep(300);
+              continue;
+            }
+            await sleep(cfg.positionDelayMs);
+
+            for (let n = 0; n < cfg.attackBurst; n += 1) {
+              if (state.stopped) break;
+              const check = state.latestArena?.monsters?.[targetIndex];
+              if (!check || Number(check.hp) <= 0) break;
+              if (!send({ type: "attack", monsterIndex: targetIndex })) break;
+              await sleep(randInt(cfg.attackDelayMinMs, cfg.attackDelayMaxMs));
+            }
+
+            await sleep(cfg.betweenBurstMs);
+          }
+        }
+      } finally {
+        state.runningLoop = false;
+      }
+    }
+
+    const buildWsUrl = (token, runId) =>
+      `${wsOrigin()}${cfg.wsPath}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
+
+    const finishDaily = (reason, extra = null) => {
+      if (!state.dailyInProgress) return;
+      state.dailyInProgress = false;
+      state.autoRestarting = false;
+      log("Arena daily finished:", reason);
+      if (typeof state.dailyResolve === "function") {
+        state.dailyResolve({
+          ok: true,
+          reason,
+          battlesLeft: state.battlesLeft,
+          maxBattlesPerDay: state.maxBattlesPerDay,
+          extra
+        });
+      }
+      state.dailyResolve = null;
+      state.dailyPromise = null;
+    };
+
+    const maybeAutoRestartAfterClose = async () => {
+      if (!state.dailyInProgress) return;
+      if (state.stopped) {
+        finishDaily("stopped");
+        return;
+      }
+      if (state.autoRestarting || state.startInFlight) return;
+
+      const left = Number(state.battlesLeft);
+      if (Number.isFinite(left) && left <= 0) {
+        finishDaily("daily_limit_reached");
+        return;
+      }
+
+      if (state.autoRestartCount >= cfg.maxAutoRestarts) {
+        finishDaily("max_auto_restart_reached");
+        return;
+      }
+
+      state.autoRestarting = true;
+      state.autoRestartCount += 1;
+      const waitMs = randInt(cfg.restartDelayMinMs, cfg.restartDelayMaxMs);
+      log(`Next arena start in ${waitMs}ms (restart #${state.autoRestartCount})`);
+      await sleep(waitMs);
+
+      try {
+        if (!state.dailyInProgress || state.stopped) return;
+        const result = await startArena({ autoConnect: true });
+        if (!result?.ok) {
+          const resultLeft = Number(result?.data?.battlesLeft);
+          if (Number.isFinite(resultLeft) && resultLeft <= 0) {
+            finishDaily("daily_limit_reached");
+          } else {
+            finishDaily("start_failed", result);
+          }
+        }
+      } catch (e) {
+        finishDaily("restart_error", { message: e?.message || String(e) });
+      } finally {
+        state.autoRestarting = false;
+      }
+    };
+
+    const handleSocketClose = (ev, ws) => {
+      if (state.activeSocket === ws) state.activeSocket = null;
+      state.runningLoop = false;
+      log("WSS close:", ev?.code ?? "?", ev?.reason || "(no reason)");
+      if (!ws.__pvDailySkipRestart) {
+        maybeAutoRestartAfterClose();
+      }
+    };
+
+    const connect = (wsUrl) => {
+      const url = wsUrl || state.lastWsUrl || (state.token && state.runId ? buildWsUrl(state.token, state.runId) : null);
+      if (!url) throw new Error("Arena wsUrl empty.");
+
+      if (state.activeSocket && state.activeSocket.readyState <= 1) {
+        try {
+          state.activeSocket.__pvDailySkipRestart = true;
+          state.activeSocket.close();
+        } catch {}
+      }
+
+      const ws = new WebSocket(url);
+      ws.addEventListener("open", () => {
+        state.activeSocket = ws;
+        log("WSS open:", url);
+        sendInitialPositionOnce();
+        runLoop();
+      });
+      ws.addEventListener("message", (ev) => parseIncoming(ev.data));
+      ws.addEventListener("close", (ev) => handleSocketClose(ev, ws));
+      ws.addEventListener("error", (ev) => warn("WSS error:", ev));
+      return ws;
+    };
+
+    const startArena = async ({ token, autoConnect = true } = {}) => {
+      if (state.startInFlight) {
+        warn("startArena already in progress.");
+        return state.lastStart;
+      }
+
+      const detected = detectToken({ activeWsUrl: state.activeSocket?.url, lastWsUrl: state.lastWsUrl });
+      const finalToken = normalizeToken(token || state.token || detected.token);
+      if (!finalToken) throw new Error("Token not found for arena.");
+      if (!token && detected.source) {
+        log(`Token detected from ${detected.source}`);
+      }
+
+      state.startInFlight = true;
+      log(`Start request -> ${cfg.startPath}`);
+
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), cfg.startTimeoutMs);
+        let res;
+
+        try {
+          res = await fetch(cfg.startPath, {
+            method: "POST",
+            headers: {
+              accept: "*/*",
+              "content-type": "application/json",
+              authorization: `Bearer ${finalToken}`
+            },
+            credentials: "include",
+            body: "{}",
+            signal: controller.signal
+          });
+        } catch (err) {
+          const msg = err?.name === "AbortError"
+            ? `Start timeout > ${cfg.startTimeoutMs}ms`
+            : `Start fetch error: ${err?.message || String(err)}`;
+          state.lastStart = {
+            time: new Date().toISOString(),
+            status: null,
+            ok: false,
+            error: msg
+          };
+          warn(msg);
+          return state.lastStart;
+        } finally {
+          clearTimeout(timeoutId);
+        }
+
+        const text = await res.text();
+        const data = safeJson(text);
+        state.lastStart = {
+          time: new Date().toISOString(),
+          status: res.status,
+          ok: res.ok,
+          data
+        };
+
+        if (!res.ok || !data || typeof data !== "object" || !data.runId) {
+          warn("Arena start failed:", state.lastStart);
+          return state.lastStart;
+        }
+
+        state.token = finalToken;
+        state.runId = data.runId;
+        state.battlesLeft = Number.isFinite(Number(data.battlesLeft)) ? Number(data.battlesLeft) : null;
+        state.maxBattlesPerDay = Number.isFinite(Number(data.maxBattlesPerDay)) ? Number(data.maxBattlesPerDay) : null;
+        state.lastWsUrl = buildWsUrl(finalToken, data.runId);
+
+        log("Arena start OK. runId:", state.runId, "| battlesLeft:", state.battlesLeft);
+        if (autoConnect) connect(state.lastWsUrl);
+
+        return {
+          ...state.lastStart,
+          runId: state.runId,
+          wsUrl: state.lastWsUrl
+        };
+      } finally {
+        state.startInFlight = false;
+      }
+    };
+
+    const stop = (reason = "manual_stop") => {
+      state.stopped = true;
+      if (state.activeSocket && state.activeSocket.readyState <= 1) {
+        try {
+          state.activeSocket.__pvDailySkipRestart = true;
+          state.activeSocket.close();
+        } catch {}
+      }
+      finishDaily(reason);
+    };
+
+    const runDaily = async () => {
+      if (state.dailyInProgress) return state.dailyPromise;
+
+      state.stopped = false;
+      state.autoRestarting = false;
+      state.autoRestartCount = 0;
+      state.dailyInProgress = true;
+      state.dailyPromise = new Promise((resolve) => {
+        state.dailyResolve = resolve;
+      });
+
+      try {
+        const first = await startArena({ autoConnect: true });
+        if (!first?.ok) {
+          const firstLeft = Number(first?.data?.battlesLeft);
+          if (Number.isFinite(firstLeft) && firstLeft <= 0) {
+            finishDaily("daily_limit_reached", first);
+          } else {
+            finishDaily("start_failed", first);
+          }
+        }
+      } catch (e) {
+        finishDaily("start_exception", { message: e?.message || String(e) });
+      }
+
+      return state.dailyPromise;
+    };
+
+    const status = () => ({
+      dailyInProgress: state.dailyInProgress,
+      stopped: state.stopped,
+      runningLoop: state.runningLoop,
+      startInFlight: state.startInFlight,
+      autoRestarting: state.autoRestarting,
+      autoRestartCount: state.autoRestartCount,
+      battlesLeft: state.battlesLeft,
+      maxBattlesPerDay: state.maxBattlesPerDay,
+      runId: state.runId,
+      wsUrl: state.lastWsUrl,
+      wsReadyState: state.activeSocket?.readyState ?? null
+    });
+
+    return {
+      runDaily,
+      stop,
+      status
+    };
+  }
+
+  function createMiningModule() {
+    const cfg = CFG.mining;
+    const log = (...args) => baseLog("[Mining]", ...args);
+    const warn = (...args) => baseWarn("[Mining]", ...args);
+
+    const state = {
+      running: false,
+      done: false,
+      reason: null,
+      promise: null,
+      resolve: null
+    };
+
+    let rockIndex = cfg.rockMin;
+    let invalidRocks = new Set();
+    let successCount = 0;
+    let nextSellAt = cfg.sellEverySuccess;
+    let lastNearFullSellAttemptAt = 0;
+
+    const getToken = () => {
+      const detected = detectToken();
+      return normalizeToken(detected.token);
+    };
+
+    const getDelay = () => {
+      if (cfg.mode === "fast") return randInt(1000, 1500);
+      return randInt(3000, 5000);
+    };
+
+    const stop = (reason) => {
+      if (state.done) return;
+      state.running = false;
+      state.done = true;
+      state.reason = reason || "stopped";
+      log("Stop:", state.reason);
+      if (typeof state.resolve === "function") {
+        state.resolve({ ok: true, reason: state.reason });
+      }
+      state.resolve = null;
+      state.promise = null;
+    };
+
+    const nextRock = () => {
+      rockIndex += 1;
+      if (rockIndex > cfg.rockMax) rockIndex = cfg.rockMin;
+    };
+
+    const getCapacity = (snapshot) => Number(snapshot?.character?.capacity ?? snapshot?.capacity ?? 0);
+    const getLevel = (snapshot) => Number(snapshot?.character?.level ?? snapshot?.level ?? 0);
+    const getDailyMined = (snapshot) => Number(snapshot?.character?.dailyMinedToday ?? snapshot?.dailyMinedToday ?? 0);
+    const getDailyLimit = (snapshot) => Number(snapshot?.character?.dailyMiningLimit ?? snapshot?.dailyMiningLimit ?? 0);
+    const countFilledSlots = (slots = []) => slots.filter((s) => s.resourceType !== "empty").length;
+
+    const sumResources = (slots = []) => {
+      const totals = { gold: 0, silver: 0, bronze: 0 };
+      for (const s of slots) {
+        if (Object.prototype.hasOwnProperty.call(totals, s.resourceType)) {
+          totals[s.resourceType] += Number(s.count || 0);
+        }
+      }
+      return totals;
+    };
+
+    const fetchCharacter = async (token) => {
+      try {
+        const res = await fetch("/api/character", {
+          credentials: "include",
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    };
+
+    const logCharacter = (data) => {
+      if (!data) return;
+      const totals = sumResources(data.slots || []);
+      const capacity = getCapacity(data);
+      const filled = countFilledSlots(data.slots || []);
+      log(
+        `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${filled}/${capacity} | Daily:${getDailyMined(data)}/${getDailyLimit(data)}`
+      );
+    };
+
+    const sellSilverBronzeAll = async (token, slots) => {
+      const charData = await fetchCharacter(token);
+      const source = charData || slots || {};
+      const level = getLevel(source);
+      if (level < 3) {
+        log(`[SELL] Skip: level ${level} (unlock level 3).`);
+        return { ok: true, sold: false, skippedByLevel: true };
+      }
+
+      let totals = sumResources(charData?.slots || []);
+      if (!totals.silver && !totals.bronze) {
+        totals = sumResources(source?.slots || []);
+      }
+      if (!totals.silver && !totals.bronze) {
+        log("[SELL] No silver/bronze to sell.");
+        return { ok: true, sold: false };
+      }
+
+      const payload = { gold: 0, silver: totals.silver, bronze: totals.bronze };
+      try {
+        const res = await fetch("/api/market/sell", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify(payload)
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          warn(`[SELL] Failed (${res.status}): ${text}`);
+          return { ok: false, sold: false };
+        }
+        log(`[SELL] Sold silver=${payload.silver}, bronze=${payload.bronze}.`);
+        return { ok: true, sold: true };
+      } catch (err) {
+        warn("[SELL] Network error:", err);
+        return { ok: false, sold: false };
+      }
+    };
+
+    const maybeAutoSell = async (token, snapshot) => {
+      const capacity = getCapacity(snapshot);
+      const slots = snapshot?.slots || [];
+      const filled = countFilledSlots(slots);
+      const freeSlots = Math.max(capacity - filled, 0);
+
+      if (capacity > 50) {
+        if (successCount < nextSellAt) return;
+        log(`[SELL] Trigger by successCount=${successCount}.`);
+        const result = await sellSilverBronzeAll(token, snapshot);
+        if (result.sold) {
+          nextSellAt += cfg.sellEverySuccess;
+        } else if (result.skippedByLevel) {
+          nextSellAt = successCount + 5;
+        }
+        return;
+      }
+
+      if (freeSlots > cfg.lowCapacityFreeSlotTrigger) return;
+      if (successCount - lastNearFullSellAttemptAt < 3) return;
+
+      lastNearFullSellAttemptAt = successCount;
+      log(`[SELL] Trigger near-full (capacity ${capacity}, free ${freeSlots}).`);
+      await sellSilverBronzeAll(token, snapshot);
+    };
+
+    const extractSnapshotFromMining = (data) => ({
+      character: data?.character || {},
+      slots: data?.slots || [],
+      dailyMinedToday: data?.dailyMinedToday,
+      dailyMiningLimit: data?.dailyMiningLimit,
+      capacity: data?.capacity
+    });
+
+    const isBackpackFull = (snapshot) => {
+      const capacity = getCapacity(snapshot);
+      if (!capacity) return false;
+      return countFilledSlots(snapshot?.slots || []) >= capacity;
+    };
+
+    const isDailyLimitReached = (snapshot) => {
+      const limit = getDailyLimit(snapshot);
+      if (!limit) return false;
+      return getDailyMined(snapshot) >= limit;
+    };
+
+    const getLatestSnapshot = async (token, fallbackSnapshot) => {
+      const latest = await fetchCharacter(token);
+      return latest || fallbackSnapshot;
+    };
+
+    const evaluateLimitsOrStop = async (token, fallbackSnapshot) => {
+      const latest = await getLatestSnapshot(token, fallbackSnapshot);
+      if (!latest) return;
+      if (isDailyLimitReached(latest)) {
+        stop("daily_limit_reached");
+        return;
+      }
+      if (isBackpackFull(latest)) {
+        stop("backpack_full");
+        return;
+      }
+      logCharacter(latest);
+    };
+
+    const hitLoop = async () => {
+      if (!state.running) return;
+
+      const token = getToken();
+      if (!token) {
+        stop("token_missing");
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/mining/hit", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            mapId: "map2",
+            rockIndex
+          })
+        });
+
+        if (!res.ok) {
+          log(`[HIT] Rock ${rockIndex} unavailable (${res.status})`);
+          invalidRocks.add(rockIndex);
+          nextRock();
+
+          if (invalidRocks.size >= (cfg.rockMax - cfg.rockMin + 1)) {
+            log("[WAIT] All rocks invalid. Wait 10s...");
+            invalidRocks.clear();
+            setTimeout(hitLoop, 10_000);
+            return;
+          }
+
+          setTimeout(hitLoop, 1_000);
+          return;
+        }
+
+        invalidRocks.delete(rockIndex);
+        const data = await res.json();
+
+        successCount += 1;
+        log(`[HIT] Success #${successCount} | Rock ${rockIndex} HP:${data.rockHealthPct}`);
+
+        if (data.drop && data.drop.resourceType !== "nothing") {
+          log(`[DROP] +${data.drop.count} ${data.drop.resourceType}`);
+        }
+
+        const snapshot = extractSnapshotFromMining(data);
+        await maybeAutoSell(token, snapshot);
+        await evaluateLimitsOrStop(token, snapshot);
+        if (!state.running) return;
+
+        if (data.rockHealthPct <= 0) {
+          log(`[ROCK] Rock ${rockIndex} destroyed`);
+          invalidRocks.add(rockIndex);
+          nextRock();
+        }
+      } catch (err) {
+        warn("[HIT] Network error:", err);
+      }
+
+      if (!state.running) return;
+      setTimeout(hitLoop, getDelay());
+    };
+
+    const runDaily = async () => {
+      if (state.running) return state.promise;
+
+      state.running = true;
+      state.done = false;
+      state.reason = null;
+      state.promise = new Promise((resolve) => {
+        state.resolve = resolve;
+      });
+
+      rockIndex = cfg.rockMin;
+      invalidRocks = new Set();
+      successCount = 0;
+      nextSellAt = cfg.sellEverySuccess;
+      lastNearFullSellAttemptAt = 0;
+
+      const token = getToken();
+      if (!token) {
+        stop("token_missing");
+        return state.promise;
+      }
+
+      log("[START] Pre-sell silver+bronze before mining...");
+      await sellSilverBronzeAll(token, null);
+
+      const charData = await fetchCharacter(token);
+      if (charData) logCharacter(charData);
+
+      log("[START] Mining loop started.");
+      hitLoop();
+
+      return state.promise;
+    };
+
+    const status = () => ({
+      running: state.running,
+      done: state.done,
+      reason: state.reason
+    });
+
+    return {
+      runDaily,
+      stop,
+      status
+    };
+  }
+
+  const arena = createArenaModule();
+  const mining = createMiningModule();
+
+  const daily = {
+    running: false,
+    stopped: false,
+    phase: "idle",
+    promise: null,
+    result: null
+  };
+
+  const stop = (reason = "manual_stop") => {
+    daily.stopped = true;
+    arena.stop(reason);
+    mining.stop(reason);
+    baseLog("Stop requested:", reason);
+  };
+
+  const run = async () => {
+    if (daily.running) return daily.promise;
+
+    daily.running = true;
+    daily.stopped = false;
+    daily.phase = "arena";
+    daily.result = null;
+
+    daily.promise = (async () => {
+      try {
+        baseLog("Daily pipeline start: arena -> mining");
+        const arenaResult = await arena.runDaily();
+
+        if (daily.stopped) {
+          return { ok: false, stopped: true, phase: "arena", arena: arenaResult, mining: null };
+        }
+
+        baseLog("Arena done:", arenaResult?.reason || "unknown");
+        daily.phase = "wait_before_mining";
+        baseLog(`Waiting ${CFG.betweenArenaAndMiningMs / 1000}s before mining...`);
+        await sleep(CFG.betweenArenaAndMiningMs);
+
+        if (daily.stopped) {
+          return { ok: false, stopped: true, phase: "wait_before_mining", arena: arenaResult, mining: null };
+        }
+
+        daily.phase = "mining";
+        const miningResult = await mining.runDaily();
+
+        daily.phase = "completed";
+        daily.result = { ok: true, arena: arenaResult, mining: miningResult };
+        baseLog("DAILY COMPLETE: arena + mining finished.");
+        return daily.result;
+      } catch (err) {
+        daily.phase = "error";
+        const result = { ok: false, error: err?.message || String(err) };
+        daily.result = result;
+        baseWarn("Daily pipeline error:", result.error);
+        return result;
+      } finally {
+        daily.running = false;
+        daily.promise = null;
+      }
+    })();
+
+    return daily.promise;
+  };
+
+  const status = () => ({
+    running: daily.running,
+    stopped: daily.stopped,
+    phase: daily.phase,
+    result: daily.result,
+    arena: arena.status(),
+    mining: mining.status()
+  });
+
+  window.pvDaily = {
+    run,
+    stop,
+    status
+  };
+
+  baseLog("Ready.");
+  baseLog("Flow: Arena daily -> wait 60s -> Mining daily -> complete log.");
+  baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status()");
+
+  if (CFG.autoRunOnLoad) {
+    run();
+  }
+})();
