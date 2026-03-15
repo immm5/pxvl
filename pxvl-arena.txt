@@ -1,6 +1,7 @@
 (() => {
   const CFG = {
     wsPattern: "/api/arena/ws",
+    wsHostPattern: "pixelvalley",
     attackBurst: 16,
     attackDelayMinMs: 44,
     attackDelayMaxMs: 66,
@@ -32,7 +33,14 @@
   const log = (...args) => console.log(`[pvExpert2 ${now()}]`, ...args);
   const warn = (...args) => console.warn(`[pvExpert2 ${now()}]`, ...args);
 
-  const isArenaUrl = (url) => typeof url === "string" && url.includes(CFG.wsPattern);
+  const isArenaUrl = (url) => {
+    if (typeof url !== "string") return false;
+    const lower = url.toLowerCase();
+    if (!lower.startsWith("wss://")) return false;
+    if (!lower.includes(CFG.wsPattern.toLowerCase())) return false;
+    if (!lower.includes(CFG.wsHostPattern.toLowerCase())) return false;
+    return true;
+  };
 
   function parseNumber(value) {
     const n = Number(value);
