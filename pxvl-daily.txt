@@ -1055,9 +1055,9 @@
           nextRock();
 
           if (invalidRocks.size >= (cfg.rockMax - cfg.rockMin + 1)) {
-            log("[WAIT] All rocks invalid. Wait 10s...");
+            log("[WAIT] All rocks invalid. Wait 60s...");
             invalidRocks.clear();
-            setTimeout(hitLoop, 10_000);
+            setTimeout(hitLoop, 60_000);
             return;
           }
 
