@@ -919,6 +919,33 @@
       );
     };
 
+    const upgradeMiningEfficiency = async (token, reason = "unspecified") => {
+      try {
+        const res = await fetch("/api/character/upgrade-mining-efficiency", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            accept: "*/*",
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: "{}"
+        });
+
+        const text = await res.text();
+        if (!res.ok) {
+          warn(`[UPGRADE] Failed (${res.status}) [${reason}]: ${text}`);
+          return { ok: false, status: res.status, body: text };
+        }
+
+        log(`[UPGRADE] Success [${reason}]: ${text}`);
+        return { ok: true, status: res.status, body: text };
+      } catch (err) {
+        warn(`[UPGRADE] Network error [${reason}]:`, err);
+        return { ok: false, status: null, body: String(err) };
+      }
+    };
+
     const sellSilverBronzeAll = async (token, slots) => {
       const charData = await fetchCharacter(token);
       const source = charData || slots || {};
@@ -954,6 +981,7 @@
           return { ok: false, sold: false };
         }
         log(`[SELL] Sold silver=${payload.silver}, bronze=${payload.bronze}.`);
+        await upgradeMiningEfficiency(token, "post-sell");
         return { ok: true, sold: true };
       } catch (err) {
         warn("[SELL] Network error:", err);
@@ -1114,6 +1142,9 @@
         stop("token_missing");
         return state.promise;
       }
+
+      log("[START] Upgrade mining efficiency before mining...");
+      await upgradeMiningEfficiency(token, "pre-mining");
 
       log("[START] Pre-sell silver+bronze before mining...");
       await sellSilverBronzeAll(token, null);
