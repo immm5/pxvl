@@ -23,9 +23,10 @@
       attackDelayMinMs: 111,
       attackDelayMaxMs: 166,
       betweenBurstMs: 132,
-      afterKillDelayMs: 1_200,
-      farMonsterXDistanceThreshold: 2,
-      farMonsterWaitMs: 10_000,
+      hpResumeThresholdPct: 0.75,
+      hpRefillPollMs: 500,
+      hpRefillWaitTimeoutMs: 120_000,
+      afterKillCooldownMs: 10_000,
       positionDelayMs: 60,
       acquireTimeoutMs: 8_000
     },
@@ -337,24 +338,47 @@
       send({ type: "position", gridX: cfg.initialPosition.gridX, gridY: cfg.initialPosition.gridY });
       log(`Monster ${killedIndex} dead. Return home (${cfg.initialPosition.gridX},${cfg.initialPosition.gridY}).`);
 
-      const next = pickNearestAliveMonsterExcluding(killedIndex);
-      if (!next) {
-        await sleep(cfg.afterKillDelayMs);
-        return;
-      }
+      const getPlayerHpRatio = () => {
+        const arena = state.latestArena || {};
+        const current = parseNumber(
+          arena.playerHp
+          ?? arena.playerCurrentHp
+          ?? arena.currentHp
+          ?? arena.character?.currentHp
+        );
+        const max = parseNumber(
+          arena.playerMaxHp
+          ?? arena.maxHp
+          ?? arena.character?.maxHp
+        );
+        if (current === null || max === null || max <= 0) return null;
+        return current / max;
+      };
 
-      let delayMs = cfg.afterKillDelayMs;
-      const nextX = parseNumber(next.m?.tileX);
-      const px = state.playerPos?.x;
-      if (nextX !== null && Number.isFinite(px)) {
-        const xDist = Math.abs(nextX - px);
-        if (xDist > cfg.farMonsterXDistanceThreshold) {
-          delayMs = cfg.farMonsterWaitMs;
-          log(`Next monster far on X (${xDist} > ${cfg.farMonsterXDistanceThreshold}). Wait ${delayMs}ms.`);
+      const waitStartAt = Date.now();
+      while (!state.stopped) {
+        const ratio = getPlayerHpRatio();
+        if (ratio === null) {
+          warn("HP data unavailable; skip HP wait.");
+          break;
         }
+        if (ratio > cfg.hpResumeThresholdPct) {
+          log(`HP ${(ratio * 100).toFixed(1)}% > ${(cfg.hpResumeThresholdPct * 100).toFixed(0)}%, continue cooldown.`);
+          break;
+        }
+        if (Date.now() - waitStartAt >= cfg.hpRefillWaitTimeoutMs) {
+          warn(
+            `Timeout waiting HP > ${(cfg.hpResumeThresholdPct * 100).toFixed(0)}% ` +
+            `(${cfg.hpRefillWaitTimeoutMs}ms), continue cooldown.`
+          );
+          break;
+        }
+        await sleep(cfg.hpRefillPollMs);
       }
 
-      await sleep(delayMs);
+      if (state.stopped) return;
+      log(`Cooldown between monsters: ${cfg.afterKillCooldownMs}ms`);
+      await sleep(cfg.afterKillCooldownMs);
     };
 
     async function runLoop() {

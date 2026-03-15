@@ -22,9 +22,10 @@
     attackDelayMinMs: 333,
     attackDelayMaxMs: 444,
     betweenBurstMs: 120,
-    afterKillDelayMs: 1200,
-    farMonsterXDistanceThreshold: 2,
-    farMonsterWaitMs: 10000,
+    hpResumeThresholdPct: 0.75,
+    hpRefillPollMs: 500,
+    hpRefillWaitTimeoutMs: 120000,
+    afterKillCooldownMs: 10000,
     positionDelayMs: 60,
     acquireTimeoutMs: 8000
   };
@@ -676,24 +677,47 @@
     send({ type: "position", gridX: CFG.initialPosition.gridX, gridY: CFG.initialPosition.gridY });
     log(`Monster ${killedIndex} mati. Return ke home (${CFG.initialPosition.gridX},${CFG.initialPosition.gridY}).`);
 
-    const next = pickNearestAliveMonsterExcluding(killedIndex);
-    if (!next) {
-      await sleep(CFG.afterKillDelayMs);
-      return;
-    }
+    const getPlayerHpRatio = () => {
+      const arena = state.latestArena || {};
+      const current = parseNumber(
+        arena.playerHp
+        ?? arena.playerCurrentHp
+        ?? arena.currentHp
+        ?? arena.character?.currentHp
+      );
+      const max = parseNumber(
+        arena.playerMaxHp
+        ?? arena.maxHp
+        ?? arena.character?.maxHp
+      );
+      if (current === null || max === null || max <= 0) return null;
+      return current / max;
+    };
 
-    let delayMs = CFG.afterKillDelayMs;
-    const nextX = parseNumber(next.m?.tileX);
-    const px = state.playerPos?.x;
-    if (nextX !== null && Number.isFinite(px)) {
-      const xDist = Math.abs(nextX - px);
-      if (xDist > CFG.farMonsterXDistanceThreshold) {
-        delayMs = CFG.farMonsterWaitMs;
-        log(`Next monster jauh di sumbu X (${xDist} > ${CFG.farMonsterXDistanceThreshold}). Wait ${delayMs}ms.`);
+    const waitStartAt = Date.now();
+    while (!state.stopped) {
+      const ratio = getPlayerHpRatio();
+      if (ratio === null) {
+        warn("Data HP tidak tersedia, skip tunggu HP.");
+        break;
       }
+      if (ratio > CFG.hpResumeThresholdPct) {
+        log(`HP ${(ratio * 100).toFixed(1)}% > ${(CFG.hpResumeThresholdPct * 100).toFixed(0)}%, lanjut cooldown.`);
+        break;
+      }
+      if (Date.now() - waitStartAt >= CFG.hpRefillWaitTimeoutMs) {
+        warn(
+          `Timeout tunggu HP > ${(CFG.hpResumeThresholdPct * 100).toFixed(0)}% ` +
+          `(${CFG.hpRefillWaitTimeoutMs}ms), lanjut cooldown.`
+        );
+        break;
+      }
+      await sleep(CFG.hpRefillPollMs);
     }
 
-    await sleep(delayMs);
+    if (state.stopped) return;
+    log(`Cooldown antar monster: ${CFG.afterKillCooldownMs}ms`);
+    await sleep(CFG.afterKillCooldownMs);
   };
 
   const acquireSocket = async () => {
