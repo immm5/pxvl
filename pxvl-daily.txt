@@ -20,8 +20,8 @@
       maxAutoRestarts: 20,
       initialPosition: { gridX: 10, gridY: 9 },
       attackBurst: 18,
-      attackDelayMinMs: 333,
-      attackDelayMaxMs: 444,
+      attackDelayMinMs: 444,
+      attackDelayMaxMs: 555,
       betweenBurstMs: 120,
       positionDelayMs: 60,
       acquireTimeoutMs: 8_000
