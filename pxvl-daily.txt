@@ -11,6 +11,8 @@
       startPath: "/api/arena/start",
       startTimeoutMs: 15_000,
       cooldownExtraWaitMs: 15_000,
+      preStartAttachTimeoutMs: 5_000,
+      activeArenaWaitTimeoutMs: 900_000,
       wsPath: "/api/arena/ws",
       wsHostPattern: "pixelvalley",
       restartDelayMinMs: 25_000,
@@ -187,12 +189,21 @@
       dailyPromise: null,
       dailyResolve: null,
       cooldownRetryTimer: null,
-      cooldownRetryAt: null
+      cooldownRetryAt: null,
+      awaitingActiveArena: false
     };
 
     const parseNumber = (value) => {
       const n = Number(value);
       return Number.isFinite(n) ? n : null;
+    };
+
+    const isArenaUrl = (url) => {
+      if (typeof url !== "string") return false;
+      const lower = url.toLowerCase();
+      return lower.startsWith("ws")
+        && lower.includes(cfg.wsPath.toLowerCase())
+        && lower.includes(cfg.wsHostPattern.toLowerCase());
     };
 
     const toPos = (x, y) => {
@@ -356,6 +367,96 @@
 
     const buildWsUrl = (token, runId) =>
       `${wsOrigin()}${cfg.wsPath}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
+
+    const findArenaUrlFromPerformance = () => {
+      try {
+        const entries = performance.getEntriesByType("resource") || [];
+        for (let i = entries.length - 1; i >= 0; i -= 1) {
+          const name = entries[i]?.name;
+          if (isArenaUrl(name)) return name;
+        }
+      } catch {}
+      return null;
+    };
+
+    const waitForSocketOpen = (ws, timeoutMs) =>
+      new Promise((resolve) => {
+        if (!ws) return resolve(false);
+        if (ws.readyState === WebSocket.OPEN) return resolve(true);
+        if (ws.readyState >= WebSocket.CLOSING) return resolve(false);
+
+        let settled = false;
+        const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(ok);
+        };
+        const onOpen = () => done(true);
+        const onClose = () => done(false);
+        const onError = () => done(false);
+        const timer = setTimeout(() => done(false), timeoutMs);
+        ws.addEventListener("open", onOpen, { once: true });
+        ws.addEventListener("close", onClose, { once: true });
+        ws.addEventListener("error", onError, { once: true });
+      });
+
+    const waitForSocketClose = (ws, timeoutMs) =>
+      new Promise((resolve) => {
+        if (!ws || ws.readyState >= WebSocket.CLOSING) return resolve(true);
+        let settled = false;
+        const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(ok);
+        };
+        const timer = setTimeout(() => done(false), timeoutMs);
+        ws.addEventListener("close", () => done(true), { once: true });
+      });
+
+    const ensureNoActiveArenaBeforeStart = async () => {
+      state.awaitingActiveArena = true;
+      try {
+        let ws = state.activeSocket;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.__pvDailySkipRestart = true;
+          log("Active arena detected. Finishing it before new start...");
+          runLoop();
+          const closed = await waitForSocketClose(ws, cfg.activeArenaWaitTimeoutMs);
+          if (!closed) warn("Timeout waiting active arena to finish. Continue with fresh start.");
+          return;
+        }
+
+        const perfUrl = findArenaUrlFromPerformance();
+        if (!perfUrl) return;
+        if (state.activeSocket?.url === perfUrl && state.activeSocket?.readyState === WebSocket.OPEN) return;
+
+        log("Trying to attach existing arena from performance WSS...");
+        ws = new WebSocket(perfUrl);
+        ws.__pvDailySkipRestart = true;
+        ws.addEventListener("open", () => {
+          state.activeSocket = ws;
+          log("WSS attached from performance:", perfUrl);
+          sendInitialPositionOnce();
+          runLoop();
+        });
+        ws.addEventListener("message", (ev) => parseIncoming(ev.data));
+        ws.addEventListener("close", (ev) => handleSocketClose(ev, ws));
+        ws.addEventListener("error", (ev) => warn("WSS attach error:", ev));
+
+        const opened = await waitForSocketOpen(ws, cfg.preStartAttachTimeoutMs);
+        if (!opened) {
+          try { ws.close(); } catch {}
+          return;
+        }
+
+        const closed = await waitForSocketClose(ws, cfg.activeArenaWaitTimeoutMs);
+        if (!closed) warn("Timeout waiting performance-attached arena to finish. Continue with fresh start.");
+      } finally {
+        state.awaitingActiveArena = false;
+      }
+    };
 
     const clearCooldownRetry = () => {
       if (state.cooldownRetryTimer) {
@@ -521,6 +622,8 @@
       log(`Start request -> ${cfg.startPath}`);
 
       try {
+        await ensureNoActiveArenaBeforeStart();
+
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), cfg.startTimeoutMs);
         let res;
@@ -654,6 +757,7 @@
       runId: state.runId,
       wsUrl: state.lastWsUrl,
       wsReadyState: state.activeSocket?.readyState ?? null,
+      awaitingActiveArena: state.awaitingActiveArena,
       cooldownRetryAt: state.cooldownRetryAt,
       cooldownRetryScheduled: Boolean(state.cooldownRetryTimer)
     });

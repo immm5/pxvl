@@ -8,6 +8,8 @@
     startPath: "/api/arena/start",
     startTimeoutMs: 15000,
     cooldownExtraWaitMs: 15000,
+    preStartAttachTimeoutMs: 5000,
+    activeArenaWaitTimeoutMs: 900000,
     wsPath: "/api/arena/ws",
     wsHostPattern: "pixelvalley",
     autoStartOnLoad: true,
@@ -64,7 +66,8 @@
     startInFlight: false,
     socketGeneration: 0,
     cooldownRetryTimer: null,
-    cooldownRetryAt: null
+    cooldownRetryAt: null,
+    awaitingActiveArena: false
   };
 
   const orig = {
@@ -309,6 +312,92 @@
   const buildWsUrl = (token, runId) =>
     `${wsOrigin()}${CFG.wsPath}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
 
+  const findArenaUrlFromPerformance = () => {
+    try {
+      const entries = performance.getEntriesByType("resource") || [];
+      for (let i = entries.length - 1; i >= 0; i -= 1) {
+        const name = entries[i]?.name;
+        if (isArenaUrl(name)) return name;
+      }
+    } catch {}
+    return null;
+  };
+
+  const waitForSocketOpen = (ws, timeoutMs) =>
+    new Promise((resolve) => {
+      if (!ws) return resolve(false);
+      if (ws.readyState === WebSocket.OPEN) return resolve(true);
+      if (ws.readyState >= WebSocket.CLOSING) return resolve(false);
+
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const onOpen = () => done(true);
+      const onClose = () => done(false);
+      const onError = () => done(false);
+      const timer = setTimeout(() => done(false), timeoutMs);
+      ws.addEventListener("open", onOpen, { once: true });
+      ws.addEventListener("close", onClose, { once: true });
+      ws.addEventListener("error", onError, { once: true });
+    });
+
+  const waitForSocketClose = (ws, timeoutMs) =>
+    new Promise((resolve) => {
+      if (!ws || ws.readyState >= WebSocket.CLOSING) return resolve(true);
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => done(false), timeoutMs);
+      ws.addEventListener("close", () => done(true), { once: true });
+    });
+
+  const ensureNoActiveArenaBeforeStart = async () => {
+    state.awaitingActiveArena = true;
+    try {
+      let ws = state.activeSocket;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.__pvArena2SkipRestart = true;
+        log("Arena aktif terdeteksi. Selesaikan dulu sebelum start baru...");
+        runLoop();
+        const closed = await waitForSocketClose(ws, CFG.activeArenaWaitTimeoutMs);
+        if (!closed) warn("Timeout menunggu arena aktif selesai. Lanjut start baru.");
+        return;
+      }
+
+      const perfUrl = findArenaUrlFromPerformance();
+      if (!perfUrl) return;
+      if (state.activeSocket?.url === perfUrl && state.activeSocket?.readyState === WebSocket.OPEN) return;
+
+      log("Mencoba attach arena aktif dari performance WSS sebelum start...");
+      ws = new orig.WebSocket(perfUrl);
+      ws.__pvArena2SkipRestart = true;
+      ws.addEventListener("open", () => {
+        attachArenaSocket(ws, "performance.prestart");
+        sendInitialPositionOnce();
+        runLoop();
+      });
+
+      const opened = await waitForSocketOpen(ws, CFG.preStartAttachTimeoutMs);
+      if (!opened) {
+        try { ws.close(); } catch {}
+        return;
+      }
+
+      const closed = await waitForSocketClose(ws, CFG.activeArenaWaitTimeoutMs);
+      if (!closed) warn("Timeout menunggu arena (performance attach) selesai. Lanjut start baru.");
+    } finally {
+      state.awaitingActiveArena = false;
+    }
+  };
+
   const setToken = (token) => {
     state.token = token;
     return token;
@@ -434,6 +523,8 @@
     state.startInFlight = true;
 
     try {
+      await ensureNoActiveArenaBeforeStart();
+
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CFG.startTimeoutMs);
       let res;
@@ -681,6 +772,7 @@
       autoRestarting: state.autoRestarting,
       autoRestartCount: state.autoRestartCount,
       startInFlight: state.startInFlight,
+      awaitingActiveArena: state.awaitingActiveArena,
       cooldownRetryAt: state.cooldownRetryAt,
       cooldownRetryScheduled: Boolean(state.cooldownRetryTimer),
       activeSocketUrl: state.activeSocket?.url ?? null,
