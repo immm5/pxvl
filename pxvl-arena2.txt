@@ -7,6 +7,7 @@
   const CFG = {
     startPath: "/api/arena/start",
     startTimeoutMs: 15000,
+    cooldownExtraWaitMs: 15000,
     wsPath: "/api/arena/ws",
     wsHostPattern: "pixelvalley",
     autoStartOnLoad: true,
@@ -61,7 +62,9 @@
     autoRestarting: false,
     autoRestartCount: 0,
     startInFlight: false,
-    socketGeneration: 0
+    socketGeneration: 0,
+    cooldownRetryTimer: null,
+    cooldownRetryAt: null
   };
 
   const orig = {
@@ -162,6 +165,49 @@
     return state.autoDailyEnabled;
   };
 
+  const clearCooldownRetry = () => {
+    if (state.cooldownRetryTimer) {
+      clearTimeout(state.cooldownRetryTimer);
+      state.cooldownRetryTimer = null;
+    }
+    state.cooldownRetryAt = null;
+  };
+
+  const scheduleCooldownRetry = (token, cooldownUntil) => {
+    const ts = Date.parse(cooldownUntil || "");
+    if (!Number.isFinite(ts)) {
+      warn("Cooldown terdeteksi tapi cooldownUntil invalid:", cooldownUntil);
+      return false;
+    }
+
+    const waitMs = Math.max(0, ts - Date.now()) + CFG.cooldownExtraWaitMs;
+    clearCooldownRetry();
+    state.cooldownRetryAt = new Date(Date.now() + waitMs).toISOString();
+
+    log(
+      `Cooldown aktif. Retry start dalam ${Math.ceil(waitMs / 1000)}s ` +
+      `(cooldownUntil + ${CFG.cooldownExtraWaitMs / 1000}s) at ${state.cooldownRetryAt}`
+    );
+
+    state.cooldownRetryTimer = setTimeout(async () => {
+      state.cooldownRetryTimer = null;
+      state.cooldownRetryAt = null;
+
+      if (state.stopped) {
+        log("Cooldown retry dibatalkan karena state stopped.");
+        return;
+      }
+
+      try {
+        await startArena({ token, autoConnect: true });
+      } catch (e) {
+        warn("Cooldown retry error:", e?.message || e);
+      }
+    }, waitMs);
+
+    return true;
+  };
+
   const maybeAutoRestartAfterClose = async (_ev) => {
     if (!state.autoDailyEnabled) return;
     if (state.stopped) return;
@@ -189,7 +235,11 @@
       if (state.stopped) return;
       const result = await startArena({ autoConnect: true });
       if (!result?.ok) {
-        warn("Auto restart start() failed:", result);
+        if (result?.cooldownScheduled) {
+          log("Start kena cooldown. Retry sudah dijadwalkan:", result.cooldownRetryAt);
+        } else {
+          warn("Auto restart start() failed:", result);
+        }
       }
     } catch (e) {
       warn("Auto restart error:", e?.message || e);
@@ -429,10 +479,22 @@
       };
 
       if (!res.ok || !data || typeof data !== "object" || !data.runId) {
+        const isCooldown = data?.error === "cooldown" && typeof data?.cooldownUntil === "string";
+        if (isCooldown) {
+          const cooldownScheduled = scheduleCooldownRetry(finalToken, data.cooldownUntil);
+          const result = {
+            ...state.lastStart,
+            cooldownScheduled,
+            cooldownRetryAt: state.cooldownRetryAt
+          };
+          warn("Start cooldown:", result);
+          return result;
+        }
         warn("Start gagal / runId tidak ada:", state.lastStart);
         return state.lastStart;
       }
 
+      clearCooldownRetry();
       state.token = finalToken;
       state.runId = data.runId;
       state.battlesLeft = Number.isFinite(Number(data.battlesLeft)) ? Number(data.battlesLeft) : null;
@@ -569,6 +631,7 @@
 
   const stop = () => {
     state.stopped = true;
+    clearCooldownRetry();
     log("Stopped.");
   };
 
@@ -618,6 +681,8 @@
       autoRestarting: state.autoRestarting,
       autoRestartCount: state.autoRestartCount,
       startInFlight: state.startInFlight,
+      cooldownRetryAt: state.cooldownRetryAt,
+      cooldownRetryScheduled: Boolean(state.cooldownRetryTimer),
       activeSocketUrl: state.activeSocket?.url ?? null,
       activeSocketReadyState: state.activeSocket?.readyState ?? null
     }),
