@@ -23,6 +23,9 @@
       attackDelayMinMs: 444,
       attackDelayMaxMs: 555,
       betweenBurstMs: 120,
+      afterKillDelayMs: 1_200,
+      farMonsterXDistanceThreshold: 2,
+      farMonsterWaitMs: 10_000,
       positionDelayMs: 60,
       acquireTimeoutMs: 8_000
     },
@@ -310,6 +313,14 @@
       return alive[0];
     };
 
+    const pickNearestAliveMonsterExcluding = (excludedIndex) => {
+      const alive = getAliveMonsters().filter((x) => x.index !== excludedIndex);
+      if (!alive.length) return null;
+      if (!state.playerPos) return alive[0];
+      alive.sort((a, b) => distanceToPlayer(a.m) - distanceToPlayer(b.m));
+      return alive[0];
+    };
+
     const acquireSocket = async () => {
       const startAt = Date.now();
       while (!state.stopped && Date.now() - startAt < cfg.acquireTimeoutMs) {
@@ -320,6 +331,30 @@
         await sleep(250);
       }
       return false;
+    };
+
+    const afterMonsterKilledTransition = async (killedIndex) => {
+      send({ type: "position", gridX: cfg.initialPosition.gridX, gridY: cfg.initialPosition.gridY });
+      log(`Monster ${killedIndex} dead. Return home (${cfg.initialPosition.gridX},${cfg.initialPosition.gridY}).`);
+
+      const next = pickNearestAliveMonsterExcluding(killedIndex);
+      if (!next) {
+        await sleep(cfg.afterKillDelayMs);
+        return;
+      }
+
+      let delayMs = cfg.afterKillDelayMs;
+      const nextX = parseNumber(next.m?.tileX);
+      const px = state.playerPos?.x;
+      if (nextX !== null && Number.isFinite(px)) {
+        const xDist = Math.abs(nextX - px);
+        if (xDist > cfg.farMonsterXDistanceThreshold) {
+          delayMs = cfg.farMonsterWaitMs;
+          log(`Next monster far on X (${xDist} > ${cfg.farMonsterXDistanceThreshold}). Wait ${delayMs}ms.`);
+        }
+      }
+
+      await sleep(delayMs);
     };
 
     async function runLoop() {
@@ -341,7 +376,12 @@
           const targetIndex = nearest.index;
           while (!state.stopped && loopSocket === state.activeSocket && loopSocket?.readyState === WebSocket.OPEN) {
             const target = state.latestArena?.monsters?.[targetIndex];
-            if (!target || Number(target.hp) <= 0) break;
+            if (!target || Number(target.hp) <= 0) {
+              if (target && Number(target.hp) <= 0) {
+                await afterMonsterKilledTransition(targetIndex);
+              }
+              break;
+            }
 
             if (!send({ type: "position", gridX: target.tileX, gridY: target.tileY })) {
               await sleep(300);

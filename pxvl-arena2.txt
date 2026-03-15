@@ -22,6 +22,9 @@
     attackDelayMinMs: 333,
     attackDelayMaxMs: 444,
     betweenBurstMs: 120,
+    afterKillDelayMs: 1200,
+    farMonsterXDistanceThreshold: 2,
+    farMonsterWaitMs: 10000,
     positionDelayMs: 60,
     acquireTimeoutMs: 8000
   };
@@ -650,6 +653,14 @@
     return alive[0];
   };
 
+  const pickNearestAliveMonsterExcluding = (excludedIndex) => {
+    const alive = getAliveMonsters().filter((x) => x.index !== excludedIndex);
+    if (!alive.length) return null;
+    if (!state.playerPos) return alive[0];
+    alive.sort((a, b) => distanceToPlayer(a.m) - distanceToPlayer(b.m));
+    return alive[0];
+  };
+
   const send = (obj) => {
     const ws = state.activeSocket;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -659,6 +670,30 @@
       if (p) state.playerPos = p;
     }
     return true;
+  };
+
+  const afterMonsterKilledTransition = async (killedIndex) => {
+    send({ type: "position", gridX: CFG.initialPosition.gridX, gridY: CFG.initialPosition.gridY });
+    log(`Monster ${killedIndex} mati. Return ke home (${CFG.initialPosition.gridX},${CFG.initialPosition.gridY}).`);
+
+    const next = pickNearestAliveMonsterExcluding(killedIndex);
+    if (!next) {
+      await sleep(CFG.afterKillDelayMs);
+      return;
+    }
+
+    let delayMs = CFG.afterKillDelayMs;
+    const nextX = parseNumber(next.m?.tileX);
+    const px = state.playerPos?.x;
+    if (nextX !== null && Number.isFinite(px)) {
+      const xDist = Math.abs(nextX - px);
+      if (xDist > CFG.farMonsterXDistanceThreshold) {
+        delayMs = CFG.farMonsterWaitMs;
+        log(`Next monster jauh di sumbu X (${xDist} > ${CFG.farMonsterXDistanceThreshold}). Wait ${delayMs}ms.`);
+      }
+    }
+
+    await sleep(delayMs);
   };
 
   const acquireSocket = async () => {
@@ -695,7 +730,12 @@
         const targetIndex = nearest.index;
         while (!state.stopped && loopSocketGeneration === state.socketGeneration) {
           const target = state.latestArena?.monsters?.[targetIndex];
-          if (!target || Number(target.hp) <= 0) break;
+          if (!target || Number(target.hp) <= 0) {
+            if (target && Number(target.hp) <= 0) {
+              await afterMonsterKilledTransition(targetIndex);
+            }
+            break;
+          }
 
           if (!send({ type: "position", gridX: target.tileX, gridY: target.tileY })) {
             if (loopSocketGeneration !== state.socketGeneration) break;
