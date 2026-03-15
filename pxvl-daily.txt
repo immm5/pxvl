@@ -10,6 +10,7 @@
     arena: {
       startPath: "/api/arena/start",
       startTimeoutMs: 15_000,
+      cooldownExtraWaitMs: 15_000,
       wsPath: "/api/arena/ws",
       wsHostPattern: "pixelvalley",
       restartDelayMinMs: 25_000,
@@ -184,7 +185,9 @@
       startInFlight: false,
       dailyInProgress: false,
       dailyPromise: null,
-      dailyResolve: null
+      dailyResolve: null,
+      cooldownRetryTimer: null,
+      cooldownRetryAt: null
     };
 
     const parseNumber = (value) => {
@@ -354,10 +357,59 @@
     const buildWsUrl = (token, runId) =>
       `${wsOrigin()}${cfg.wsPath}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
 
+    const clearCooldownRetry = () => {
+      if (state.cooldownRetryTimer) {
+        clearTimeout(state.cooldownRetryTimer);
+        state.cooldownRetryTimer = null;
+      }
+      state.cooldownRetryAt = null;
+    };
+
+    const scheduleCooldownRetry = (token, cooldownUntil) => {
+      const ts = Date.parse(cooldownUntil || "");
+      if (!Number.isFinite(ts)) {
+        warn("Cooldown received but cooldownUntil invalid:", cooldownUntil);
+        return false;
+      }
+
+      const waitMs = Math.max(0, ts - Date.now()) + cfg.cooldownExtraWaitMs;
+      clearCooldownRetry();
+      state.cooldownRetryAt = new Date(Date.now() + waitMs).toISOString();
+
+      log(
+        `Arena cooldown active. Retry in ${Math.ceil(waitMs / 1000)}s ` +
+        `(cooldownUntil + ${cfg.cooldownExtraWaitMs / 1000}s) at ${state.cooldownRetryAt}`
+      );
+
+      state.cooldownRetryTimer = setTimeout(async () => {
+        state.cooldownRetryTimer = null;
+        state.cooldownRetryAt = null;
+
+        if (!state.dailyInProgress || state.stopped) return;
+
+        try {
+          const result = await startArena({ token, autoConnect: true });
+          if (!result?.ok && !result?.cooldownScheduled) {
+            const resultLeft = Number(result?.data?.battlesLeft);
+            if (Number.isFinite(resultLeft) && resultLeft <= 0) {
+              finishDaily("daily_limit_reached");
+            } else {
+              finishDaily("start_failed", result);
+            }
+          }
+        } catch (e) {
+          finishDaily("restart_error", { message: e?.message || String(e) });
+        }
+      }, waitMs);
+
+      return true;
+    };
+
     const finishDaily = (reason, extra = null) => {
       if (!state.dailyInProgress) return;
       state.dailyInProgress = false;
       state.autoRestarting = false;
+      clearCooldownRetry();
       log("Arena daily finished:", reason);
       if (typeof state.dailyResolve === "function") {
         state.dailyResolve({
@@ -401,11 +453,15 @@
         if (!state.dailyInProgress || state.stopped) return;
         const result = await startArena({ autoConnect: true });
         if (!result?.ok) {
-          const resultLeft = Number(result?.data?.battlesLeft);
-          if (Number.isFinite(resultLeft) && resultLeft <= 0) {
-            finishDaily("daily_limit_reached");
+          if (result?.cooldownScheduled) {
+            log("Start hit cooldown. Retry already scheduled at:", result.cooldownRetryAt);
           } else {
-            finishDaily("start_failed", result);
+            const resultLeft = Number(result?.data?.battlesLeft);
+            if (Number.isFinite(resultLeft) && resultLeft <= 0) {
+              finishDaily("daily_limit_reached");
+            } else {
+              finishDaily("start_failed", result);
+            }
           }
         }
       } catch (e) {
@@ -507,10 +563,22 @@
         };
 
         if (!res.ok || !data || typeof data !== "object" || !data.runId) {
+          const isCooldown = data?.error === "cooldown" && typeof data?.cooldownUntil === "string";
+          if (isCooldown) {
+            const cooldownScheduled = scheduleCooldownRetry(finalToken, data.cooldownUntil);
+            const result = {
+              ...state.lastStart,
+              cooldownScheduled,
+              cooldownRetryAt: state.cooldownRetryAt
+            };
+            warn("Arena start cooldown:", result);
+            return result;
+          }
           warn("Arena start failed:", state.lastStart);
           return state.lastStart;
         }
 
+        clearCooldownRetry();
         state.token = finalToken;
         state.runId = data.runId;
         state.battlesLeft = Number.isFinite(Number(data.battlesLeft)) ? Number(data.battlesLeft) : null;
@@ -532,6 +600,7 @@
 
     const stop = (reason = "manual_stop") => {
       state.stopped = true;
+      clearCooldownRetry();
       if (state.activeSocket && state.activeSocket.readyState <= 1) {
         try {
           state.activeSocket.__pvDailySkipRestart = true;
@@ -555,11 +624,15 @@
       try {
         const first = await startArena({ autoConnect: true });
         if (!first?.ok) {
-          const firstLeft = Number(first?.data?.battlesLeft);
-          if (Number.isFinite(firstLeft) && firstLeft <= 0) {
-            finishDaily("daily_limit_reached", first);
+          if (first?.cooldownScheduled) {
+            log("Initial start hit cooldown. Waiting retry at:", first.cooldownRetryAt);
           } else {
-            finishDaily("start_failed", first);
+            const firstLeft = Number(first?.data?.battlesLeft);
+            if (Number.isFinite(firstLeft) && firstLeft <= 0) {
+              finishDaily("daily_limit_reached", first);
+            } else {
+              finishDaily("start_failed", first);
+            }
           }
         }
       } catch (e) {
@@ -580,7 +653,9 @@
       maxBattlesPerDay: state.maxBattlesPerDay,
       runId: state.runId,
       wsUrl: state.lastWsUrl,
-      wsReadyState: state.activeSocket?.readyState ?? null
+      wsReadyState: state.activeSocket?.readyState ?? null,
+      cooldownRetryAt: state.cooldownRetryAt,
+      cooldownRetryScheduled: Boolean(state.cooldownRetryTimer)
     });
 
     return {
