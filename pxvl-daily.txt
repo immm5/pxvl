@@ -6,6 +6,9 @@
 
   const CFG = {
     autoRunOnLoad: true,
+    autoRerunWindowEnabled: true,
+    autoRerunWindowStart: { hour: 7, minute: 5 },
+    autoRerunWindowEnd: { hour: 7, minute: 30 },
     betweenArenaAndMiningMs: 60_000,
     arena: {
       startPath: "/api/arena/start",
@@ -1179,7 +1182,93 @@
     stopped: false,
     phase: "idle",
     promise: null,
-    result: null
+    result: null,
+    autoRerunTimer: null,
+    autoRerunAt: null,
+    autoRerunLastDayKey: null
+  };
+
+  const dayKey = (date) =>
+    `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+  const toLocalDateTime = (base, hour, minute, second = 0, ms = 0) => {
+    const d = new Date(base);
+    d.setHours(hour, minute, second, ms);
+    return d;
+  };
+
+  const randomMsBetween = (fromMs, toMs) => {
+    if (toMs <= fromMs) return fromMs;
+    return Math.floor(Math.random() * (toMs - fromMs + 1)) + fromMs;
+  };
+
+  const clearAutoRerunTimer = () => {
+    if (daily.autoRerunTimer) {
+      clearTimeout(daily.autoRerunTimer);
+      daily.autoRerunTimer = null;
+    }
+    daily.autoRerunAt = null;
+  };
+
+  const computeNextAutoRerunAt = (now = new Date()) => {
+    const startCfg = CFG.autoRerunWindowStart;
+    const endCfg = CFG.autoRerunWindowEnd;
+    const todayStart = toLocalDateTime(now, startCfg.hour, startCfg.minute, 0, 0);
+    const todayEnd = toLocalDateTime(now, endCfg.hour, endCfg.minute, 59, 999);
+    const today = dayKey(now);
+
+    if (now < todayStart) {
+      const pickMs = randomMsBetween(todayStart.getTime(), todayEnd.getTime());
+      return new Date(pickMs);
+    }
+
+    if (now <= todayEnd && daily.autoRerunLastDayKey !== today) {
+      const fromMs = Math.max(now.getTime() + 1_000, todayStart.getTime());
+      const pickMs = randomMsBetween(fromMs, todayEnd.getTime());
+      return new Date(pickMs);
+    }
+
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowStart = toLocalDateTime(tomorrow, startCfg.hour, startCfg.minute, 0, 0);
+    const tomorrowEnd = toLocalDateTime(tomorrow, endCfg.hour, endCfg.minute, 59, 999);
+    const pickMs = randomMsBetween(tomorrowStart.getTime(), tomorrowEnd.getTime());
+    return new Date(pickMs);
+  };
+
+  const scheduleNextAutoRerun = (reason = "unspecified") => {
+    if (!CFG.autoRerunWindowEnabled) return;
+    clearAutoRerunTimer();
+
+    const nowDate = new Date();
+    const nextAt = computeNextAutoRerunAt(nowDate);
+    const delayMs = Math.max(1_000, nextAt.getTime() - nowDate.getTime());
+
+    daily.autoRerunAt = nextAt.toISOString();
+    baseLog(`[AutoRerun] Next run scheduled (${reason}) at ${nextAt.toLocaleString()} (in ${Math.ceil(delayMs / 1000)}s).`);
+
+    daily.autoRerunTimer = setTimeout(async () => {
+      daily.autoRerunTimer = null;
+      daily.autoRerunAt = null;
+      const triggerDay = dayKey(new Date());
+      if (daily.autoRerunLastDayKey === triggerDay) {
+        scheduleNextAutoRerun("already_triggered_today");
+        return;
+      }
+      daily.autoRerunLastDayKey = triggerDay;
+
+      baseLog("[AutoRerun] Triggering scheduled daily run...");
+      try {
+        if (daily.running) {
+          baseLog("[AutoRerun] Existing run detected, restarting flow.");
+          stop("scheduled_restart");
+          await sleep(2_000);
+        }
+        run().catch((e) => baseWarn("[AutoRerun] run() error:", e?.message || e));
+      } finally {
+        scheduleNextAutoRerun("post_trigger");
+      }
+    }, delayMs);
   };
 
   const stop = (reason = "manual_stop") => {
@@ -1312,6 +1401,9 @@
     stopped: daily.stopped,
     phase: daily.phase,
     result: daily.result,
+    autoRerunAt: daily.autoRerunAt,
+    autoRerunEnabled: CFG.autoRerunWindowEnabled,
+    autoRerunWindow: `${String(CFG.autoRerunWindowStart.hour).padStart(2, "0")}:${String(CFG.autoRerunWindowStart.minute).padStart(2, "0")} - ${String(CFG.autoRerunWindowEnd.hour).padStart(2, "0")}:${String(CFG.autoRerunWindowEnd.minute).padStart(2, "0")}`,
     arena: arena.status(),
     mining: mining.status()
   });
@@ -1325,6 +1417,10 @@
   baseLog("Ready.");
   baseLog("Flow: Arena daily -> wait 60s -> Mining daily -> complete log.");
   baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status()");
+
+  if (CFG.autoRerunWindowEnabled) {
+    scheduleNextAutoRerun("init");
+  }
 
   if (CFG.autoRunOnLoad) {
     run();
