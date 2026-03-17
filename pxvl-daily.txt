@@ -34,7 +34,7 @@
       mode: "normal", // normal / fast
       rockMin: 0,
       rockMax: 5,
-      sellEverySuccess: 50,
+      sellEverySuccess: 25,
       lowCapacityFreeSlotTrigger: 4
     }
   };
@@ -1198,9 +1198,71 @@
     daily.result = null;
 
     daily.promise = (async () => {
+      let cooldownMiningStopTimer = null;
+      let handledCooldownRetryAt = null;
+      const clearCooldownMiningStopTimer = () => {
+        if (cooldownMiningStopTimer) {
+          clearTimeout(cooldownMiningStopTimer);
+          cooldownMiningStopTimer = null;
+        }
+      };
+
+      const maybeRunMiningDuringArenaCooldown = () => {
+        const arenaStatus = arena.status();
+        const retryAt = arenaStatus?.cooldownRetryAt;
+        const scheduled = arenaStatus?.cooldownRetryScheduled;
+        if (!scheduled || !retryAt) return;
+        if (handledCooldownRetryAt === retryAt) return;
+
+        const retryAtMs = Date.parse(retryAt);
+        if (!Number.isFinite(retryAtMs)) return;
+        const remainingMs = Math.max(0, retryAtMs - Date.now());
+        handledCooldownRetryAt = retryAt;
+
+        if (remainingMs < 3_000) return;
+
+        baseLog(
+          `[Arena->Mining] Arena cooldown detected (${Math.ceil(remainingMs / 1000)}s). ` +
+          "Run mining sementara sampai cooldown selesai."
+        );
+
+        if (!mining.status().running) {
+          mining.runDaily().catch((e) => baseWarn("[Arena->Mining] Mining temp run error:", e?.message || e));
+        }
+
+        clearCooldownMiningStopTimer();
+        cooldownMiningStopTimer = setTimeout(() => {
+          if (mining.status().running) {
+            baseLog("[Arena->Mining] Cooldown arena selesai. Stop mining sementara untuk retry arena.");
+            mining.stop("pause_for_arena_retry");
+          }
+        }, Math.max(1_000, remainingMs - 1_000));
+      };
+
       try {
         baseLog("Daily pipeline start: arena -> mining");
-        const arenaResult = await arena.runDaily();
+        const arenaPromise = arena.runDaily();
+        let arenaDone = false;
+        let arenaResult = null;
+        arenaPromise.then((res) => {
+          arenaDone = true;
+          arenaResult = res;
+        });
+
+        while (!arenaDone && !daily.stopped) {
+          maybeRunMiningDuringArenaCooldown();
+          await sleep(1_000);
+        }
+
+        if (!arenaDone) {
+          arenaResult = await arenaPromise;
+        }
+
+        clearCooldownMiningStopTimer();
+        if (mining.status().running) {
+          baseLog("[Arena->Mining] Arena phase selesai. Stop mining sementara.");
+          mining.stop("arena_finished");
+        }
 
         if (daily.stopped) {
           return { ok: false, stopped: true, phase: "arena", arena: arenaResult, mining: null };
@@ -1216,7 +1278,14 @@
         }
 
         daily.phase = "mining";
-        const miningResult = await mining.runDaily();
+        const miningStatus = mining.status();
+        let miningResult;
+        if (miningStatus.reason === "daily_limit_reached" || miningStatus.reason === "backpack_full") {
+          baseLog("Mining sudah selesai saat fase cooldown arena, skip mining final.");
+          miningResult = { ok: true, reason: "already_completed_during_arena_cooldown", detail: miningStatus };
+        } else {
+          miningResult = await mining.runDaily();
+        }
 
         daily.phase = "completed";
         daily.result = { ok: true, arena: arenaResult, mining: miningResult };
@@ -1229,6 +1298,7 @@
         baseWarn("Daily pipeline error:", result.error);
         return result;
       } finally {
+        clearCooldownMiningStopTimer();
         daily.running = false;
         daily.promise = null;
       }
