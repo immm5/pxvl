@@ -250,8 +250,29 @@ async function evaluateLimitsOrStop(token, fallbackSnapshot) {
   }
 
   if (isBackpackFull(latest)) {
-    stop("Backpack full");
-    return;
+    const level = getLevel(latest);
+    if (level < 3) {
+      stop("Backpack full while level < 3. Naikkan level via arena dulu.");
+      return;
+    }
+
+    console.log("[BAG] Full dan level >= 3. Coba sell silver/bronze dulu...");
+    const sellResult = await sellSilverBronzeAll(token, latest);
+    if (!sellResult?.sold) {
+      stop("Backpack full dan sell gagal. Stop mining.");
+      return;
+    }
+
+    const afterSell = await fetchCharacter(token);
+    if (afterSell && isBackpackFull(afterSell)) {
+      stop("Backpack masih full setelah sell. Stop mining.");
+      return;
+    }
+
+    if (afterSell) {
+      logCharacter(afterSell);
+      return;
+    }
   }
 
   logCharacter(latest);

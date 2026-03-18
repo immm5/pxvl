@@ -1051,8 +1051,29 @@
         return;
       }
       if (isBackpackFull(latest)) {
-        stop("backpack_full");
-        return;
+        const level = getLevel(latest);
+        if (level < 3) {
+          stop("backpack_full_level_lt_3_run_arena");
+          return;
+        }
+
+        log("[BAG] Full and level >= 3. Try sell silver/bronze first...");
+        const sellResult = await sellSilverBronzeAll(token, latest);
+        if (!sellResult?.sold) {
+          stop("backpack_full_sell_failed");
+          return;
+        }
+
+        const afterSell = await fetchCharacter(token);
+        if (afterSell && isBackpackFull(afterSell)) {
+          stop("backpack_still_full_after_sell");
+          return;
+        }
+
+        if (afterSell) {
+          logCharacter(afterSell);
+          return;
+        }
       }
       logCharacter(latest);
     };
