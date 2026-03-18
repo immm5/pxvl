@@ -4,7 +4,7 @@
 let MODE = "normal"; // normal / fast
 const ROCK_MIN = 0;
 const ROCK_MAX = 5;
-const SELL_EVERY_SUCCESS = 50;
+const SELL_EVERY_SUCCESS = 25;
 const LOW_CAPACITY_FREE_SLOT_TRIGGER = 4;
 
 let running = true;
@@ -99,6 +99,33 @@ function logCharacter(data) {
   );
 }
 
+async function upgradeMiningEfficiency(token, reason = "unspecified") {
+  try {
+    const res = await fetch("/api/character/upgrade-mining-efficiency", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "*/*",
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: "{}"
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      console.log(`[UPGRADE] Gagal (${res.status}) [${reason}]: ${text}`);
+      return { ok: false, status: res.status, body: text };
+    }
+
+    console.log(`[UPGRADE] Berhasil [${reason}]: ${text}`);
+    return { ok: true, status: res.status, body: text };
+  } catch (err) {
+    console.log(`[UPGRADE] Network error [${reason}]:`, err);
+    return { ok: false, status: null, body: String(err) };
+  }
+}
+
 async function sellSilverBronzeAll(token, slots) {
   // Prioritaskan data terbaru dari /api/character sebelum sell.
   const charData = await fetchCharacter(token);
@@ -143,6 +170,7 @@ async function sellSilverBronzeAll(token, slots) {
     }
 
     console.log(`[SELL] Berhasil jual silver=${payload.silver}, bronze=${payload.bronze}. Resp: ${text}`);
+    await upgradeMiningEfficiency(token, "post-sell");
     return { ok: true, sold: true };
   } catch (err) {
     console.log("[SELL] Network error:", err);
@@ -302,6 +330,9 @@ async function startMining() {
     stop("Token tidak ditemukan di storage.");
     return;
   }
+
+  console.log("[START] Upgrade mining efficiency sebelum mining...");
+  await upgradeMiningEfficiency(token, "pre-mining");
 
   console.log("[START] Pre-sell silver+bronze sebelum mining...");
   await sellSilverBronzeAll(token, null);
