@@ -888,6 +888,14 @@
     const getDailyMined = (snapshot) => Number(snapshot?.character?.dailyMinedToday ?? snapshot?.dailyMinedToday ?? 0);
     const getDailyLimit = (snapshot) => Number(snapshot?.character?.dailyMiningLimit ?? snapshot?.dailyMiningLimit ?? 0);
     const countFilledSlots = (slots = []) => slots.filter((s) => s.resourceType !== "empty").length;
+    const getBagUsed = (snapshot) => {
+      const slots = snapshot?.slots || [];
+      return slots.reduce((sum, s) => {
+        if (!s || s.resourceType === "empty") return sum;
+        const count = Number(s.count || 0);
+        return sum + (Number.isFinite(count) && count > 0 ? count : 0);
+      }, 0);
+    };
 
     const sumResources = (slots = []) => {
       const totals = { gold: 0, silver: 0, bronze: 0 };
@@ -916,9 +924,10 @@
       if (!data) return;
       const totals = sumResources(data.slots || []);
       const capacity = getCapacity(data);
-      const filled = countFilledSlots(data.slots || []);
+      const used = getBagUsed(data);
+      const filledSlots = countFilledSlots(data.slots || []);
       log(
-        `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${filled}/${capacity} | Daily:${getDailyMined(data)}/${getDailyLimit(data)}`
+        `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${used}/${capacity} (slots:${filledSlots}) | Daily:${getDailyMined(data)}/${getDailyLimit(data)}`
       );
     };
 
@@ -994,9 +1003,8 @@
 
     const maybeAutoSell = async (token, snapshot) => {
       const capacity = getCapacity(snapshot);
-      const slots = snapshot?.slots || [];
-      const filled = countFilledSlots(slots);
-      const freeSlots = Math.max(capacity - filled, 0);
+      const used = getBagUsed(snapshot);
+      const freeCapacity = Math.max(capacity - used, 0);
 
       if (capacity > 50) {
         if (successCount < nextSellAt) return;
@@ -1010,11 +1018,11 @@
         return;
       }
 
-      if (freeSlots > cfg.lowCapacityFreeSlotTrigger) return;
+      if (freeCapacity > cfg.lowCapacityFreeSlotTrigger) return;
       if (successCount - lastNearFullSellAttemptAt < 3) return;
 
       lastNearFullSellAttemptAt = successCount;
-      log(`[SELL] Trigger near-full (capacity ${capacity}, free ${freeSlots}).`);
+      log(`[SELL] Trigger near-full (capacity ${capacity}, used ${used}, free ${freeCapacity}).`);
       await sellSilverBronzeAll(token, snapshot);
     };
 
@@ -1029,7 +1037,7 @@
     const isBackpackFull = (snapshot) => {
       const capacity = getCapacity(snapshot);
       if (!capacity) return false;
-      return countFilledSlots(snapshot?.slots || []) >= capacity;
+      return getBagUsed(snapshot) >= capacity;
     };
 
     const isDailyLimitReached = (snapshot) => {

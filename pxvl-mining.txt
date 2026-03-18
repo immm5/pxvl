@@ -64,6 +64,15 @@ function countFilledSlots(slots = []) {
   return slots.filter(s => s.resourceType !== "empty").length;
 }
 
+function getBagUsed(snapshot) {
+  const slots = snapshot?.slots || [];
+  return slots.reduce((sum, s) => {
+    if (!s || s.resourceType === "empty") return sum;
+    const count = Number(s.count || 0);
+    return sum + (Number.isFinite(count) && count > 0 ? count : 0);
+  }, 0);
+}
+
 function sumResources(slots = []) {
   const totals = { gold: 0, silver: 0, bronze: 0 };
   for (const s of slots) {
@@ -93,9 +102,10 @@ function logCharacter(data) {
   if (!data) return;
   const totals = sumResources(data.slots || []);
   const capacity = getCapacity(data);
-  const filled = countFilledSlots(data.slots || []);
+  const used = getBagUsed(data);
+  const filledSlots = countFilledSlots(data.slots || []);
   console.log(
-    `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${filled}/${capacity} | Daily:${getDailyMined(data)}/${getDailyLimit(data)}`
+    `GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${used}/${capacity} (slots:${filledSlots}) | Daily:${getDailyMined(data)}/${getDailyLimit(data)}`
   );
 }
 
@@ -180,9 +190,8 @@ async function sellSilverBronzeAll(token, slots) {
 
 async function maybeAutoSell(token, snapshot) {
   const capacity = getCapacity(snapshot);
-  const slots = snapshot?.slots || [];
-  const filled = countFilledSlots(slots);
-  const freeSlots = Math.max(capacity - filled, 0);
+  const used = getBagUsed(snapshot);
+  const freeCapacity = Math.max(capacity - used, 0);
 
   if (capacity > 50) {
     if (successCount < nextSellAt) return;
@@ -197,11 +206,11 @@ async function maybeAutoSell(token, snapshot) {
     return;
   }
 
-  if (freeSlots > LOW_CAPACITY_FREE_SLOT_TRIGGER) return;
+  if (freeCapacity > LOW_CAPACITY_FREE_SLOT_TRIGGER) return;
   if (successCount - lastNearFullSellAttemptAt < 3) return;
 
   lastNearFullSellAttemptAt = successCount;
-  console.log(`[SELL] Trigger near-full (capacity ${capacity}, free ${freeSlots}). Menjual silver+bronze...`);
+  console.log(`[SELL] Trigger near-full (capacity ${capacity}, used ${used}, free ${freeCapacity}). Menjual silver+bronze...`);
   await sellSilverBronzeAll(token, snapshot);
 }
 
@@ -218,7 +227,7 @@ function extractSnapshotFromMining(data) {
 function isBackpackFull(snapshot) {
   const capacity = getCapacity(snapshot);
   if (!capacity) return false;
-  return countFilledSlots(snapshot?.slots || []) >= capacity;
+  return getBagUsed(snapshot) >= capacity;
 }
 
 function isDailyLimitReached(snapshot) {
