@@ -310,6 +310,13 @@ async function hitLoop() {
         stop("Daily limit reached (hit response)");
         return;
       }
+      if (errBody?.error === "inventory_full") {
+        console.log("[BAG] /api/mining/hit returned inventory_full. Checking backpack state...");
+        await evaluateLimitsOrStop(token);
+        if (!running) return;
+        setTimeout(hitLoop, 1000);
+        return;
+      }
 
       console.log(`[HIT] Rock ${rockIndex} tidak bisa di-hit (${res.status}) ${raw ? `| ${raw}` : ""}`);
       invalidRocks.add(rockIndex);
@@ -328,6 +335,17 @@ async function hitLoop() {
 
     invalidRocks.delete(rockIndex);
     const data = await res.json();
+    if (data?.error === "daily_limit_reached") {
+      stop("Daily limit reached (hit response)");
+      return;
+    }
+    if (data?.error === "inventory_full") {
+      console.log("[BAG] Mining response returned inventory_full. Checking backpack state...");
+      await evaluateLimitsOrStop(token);
+      if (!running) return;
+      setTimeout(hitLoop, 1000);
+      return;
+    }
 
     successCount += 1;
     console.log(`[HIT] Sukses #${successCount} | Rock ${rockIndex} HP: ${data.rockHealthPct}`);

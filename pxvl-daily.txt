@@ -1110,6 +1110,13 @@
             stop("daily_limit_reached");
             return;
           }
+          if (errBody?.error === "inventory_full") {
+            log("[BAG] /api/mining/hit returned inventory_full. Checking bag state...");
+            await evaluateLimitsOrStop(token);
+            if (!state.running) return;
+            setTimeout(hitLoop, 1_000);
+            return;
+          }
 
           log(`[HIT] Rock ${rockIndex} unavailable (${res.status}) ${raw ? `| ${raw}` : ""}`);
           invalidRocks.add(rockIndex);
@@ -1128,6 +1135,17 @@
 
         invalidRocks.delete(rockIndex);
         const data = await res.json();
+        if (data?.error === "daily_limit_reached") {
+          stop("daily_limit_reached");
+          return;
+        }
+        if (data?.error === "inventory_full") {
+          log("[BAG] Mining response returned inventory_full. Checking bag state...");
+          await evaluateLimitsOrStop(token);
+          if (!state.running) return;
+          setTimeout(hitLoop, 1_000);
+          return;
+        }
 
         successCount += 1;
         log(`[HIT] Success #${successCount} | Rock ${rockIndex} HP:${data.rockHealthPct}`);
