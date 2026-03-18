@@ -281,7 +281,16 @@ async function hitLoop() {
     });
 
     if (!res.ok) {
-      console.log(`[HIT] Rock ${rockIndex} tidak bisa di-hit (${res.status})`);
+      const raw = await res.text();
+      let errBody = null;
+      try { errBody = JSON.parse(raw); } catch {}
+
+      if (errBody?.error === "daily_limit_reached") {
+        stop("Daily limit reached (hit response)");
+        return;
+      }
+
+      console.log(`[HIT] Rock ${rockIndex} tidak bisa di-hit (${res.status}) ${raw ? `| ${raw}` : ""}`);
       invalidRocks.add(rockIndex);
       nextRock();
 

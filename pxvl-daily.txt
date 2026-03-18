@@ -1081,7 +1081,16 @@
         });
 
         if (!res.ok) {
-          log(`[HIT] Rock ${rockIndex} unavailable (${res.status})`);
+          const raw = await res.text();
+          let errBody = null;
+          try { errBody = JSON.parse(raw); } catch {}
+
+          if (errBody?.error === "daily_limit_reached") {
+            stop("daily_limit_reached");
+            return;
+          }
+
+          log(`[HIT] Rock ${rockIndex} unavailable (${res.status}) ${raw ? `| ${raw}` : ""}`);
           invalidRocks.add(rockIndex);
           nextRock();
 
