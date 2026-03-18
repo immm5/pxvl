@@ -9,7 +9,7 @@
     autoRerunWindowEnabled: true,
     autoRerunWindowStart: { hour: 7, minute: 5 },
     autoRerunWindowEnd: { hour: 7, minute: 30 },
-    betweenArenaAndMiningMs: 60_000,
+    betweenArenaAndMiningMs: 25_000,
     arena: {
       startPath: "/api/arena/start",
       startTimeoutMs: 15_000,
