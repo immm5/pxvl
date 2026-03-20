@@ -22,11 +22,12 @@
     attackDelayMinMs: 333,
     attackDelayMaxMs: 444,
     betweenBurstMs: 120,
-    hpResumeThresholdPct: 0.75,
+    hpResumeThresholdPct: 0.8,
     hpRefillPollMs: 500,
     hpRefillWaitTimeoutMs: 120000,
     afterKillCooldownMs: 10000,
     chainAttackMaxDistance: 2,
+    cooldownThreatDistance: 2,
     positionDelayMs: 60,
     acquireTimeoutMs: 8000
   };
@@ -663,6 +664,16 @@
     return alive[0];
   };
 
+  const pickNearbyAliveMonster = (maxDistance, excludedIndex = null) => {
+    const nearest = excludedIndex === null
+      ? pickNearestAliveMonster()
+      : pickNearestAliveMonsterExcluding(excludedIndex);
+    if (!nearest) return null;
+    const distance = distanceToPlayer(nearest.m);
+    if (!Number.isFinite(distance) || distance > maxDistance) return null;
+    return { ...nearest, distance };
+  };
+
   const send = (obj) => {
     const ws = state.activeSocket;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -675,16 +686,13 @@
   };
 
   const afterMonsterKilledTransition = async (killedIndex) => {
-    const nearby = pickNearestAliveMonsterExcluding(killedIndex);
+    const nearby = pickNearbyAliveMonster(CFG.chainAttackMaxDistance, killedIndex);
     if (nearby) {
-      const dist = distanceToPlayer(nearby.m);
-      if (Number.isFinite(dist) && dist <= CFG.chainAttackMaxDistance) {
-        log(
-          `Monster ${killedIndex} mati. Monster dekat ${nearby.index} distance=${dist} ` +
-          `<= ${CFG.chainAttackMaxDistance}, lanjut chain attack sebelum cooldown.`
-        );
-        return;
-      }
+      log(
+        `Monster ${killedIndex} mati. Monster dekat ${nearby.index} distance=${nearby.distance} ` +
+        `<= ${CFG.chainAttackMaxDistance}, lanjut chain attack sebelum cooldown.`
+      );
+      return;
     }
 
     send({ type: "position", gridX: CFG.initialPosition.gridX, gridY: CFG.initialPosition.gridY });
@@ -708,8 +716,25 @@
     };
 
     const waitStartAt = Date.now();
+    let prevHpRatio = getPlayerHpRatio();
     while (!state.stopped) {
       const ratio = getPlayerHpRatio();
+      const closeThreat = pickNearbyAliveMonster(CFG.cooldownThreatDistance);
+      const hpDropped = ratio !== null && prevHpRatio !== null && ratio + 0.0001 < prevHpRatio;
+      if (closeThreat) {
+        log(
+          `[DEFENSE] Persiapan cooldown dibatalkan. Monster ${closeThreat.index} ` +
+          `distance=${closeThreat.distance} <= ${CFG.cooldownThreatDistance}. Balas serang.`
+        );
+        return;
+      }
+      if (hpDropped) {
+        const retaliation = pickNearestAliveMonster();
+        if (retaliation) {
+          log(`[DEFENSE] HP turun saat persiapan cooldown. Balas serang monster ${retaliation.index}.`);
+          return;
+        }
+      }
       if (ratio === null) {
         warn("Data HP tidak tersedia, skip tunggu HP.");
         break;
@@ -725,12 +750,38 @@
         );
         break;
       }
+      prevHpRatio = ratio;
       await sleep(CFG.hpRefillPollMs);
     }
 
     if (state.stopped) return;
     log(`Cooldown antar monster: ${CFG.afterKillCooldownMs}ms`);
-    await sleep(CFG.afterKillCooldownMs);
+    const cooldownStartAt = Date.now();
+    let cooldownPrevHpRatio = getPlayerHpRatio();
+    while (!state.stopped && Date.now() - cooldownStartAt < CFG.afterKillCooldownMs) {
+      const ratio = getPlayerHpRatio();
+      const closeThreat = pickNearbyAliveMonster(CFG.cooldownThreatDistance);
+      const hpDropped = ratio !== null && cooldownPrevHpRatio !== null && ratio + 0.0001 < cooldownPrevHpRatio;
+      if (closeThreat) {
+        log(
+          `[DEFENSE] Cooldown dibatalkan. Monster ${closeThreat.index} ` +
+          `distance=${closeThreat.distance} <= ${CFG.cooldownThreatDistance}. Balas serang.`
+        );
+        return;
+      }
+      if (hpDropped) {
+        const retaliation = pickNearestAliveMonster();
+        if (retaliation) {
+          log(`[DEFENSE] HP turun saat cooldown. Balas serang monster ${retaliation.index}.`);
+          return;
+        }
+      }
+      if (ratio !== null) cooldownPrevHpRatio = ratio;
+      const elapsed = Date.now() - cooldownStartAt;
+      const remaining = Math.max(0, CFG.afterKillCooldownMs - elapsed);
+      if (!remaining) break;
+      await sleep(Math.min(CFG.hpRefillPollMs, remaining));
+    }
   };
 
   const acquireSocket = async () => {
