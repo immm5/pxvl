@@ -22,7 +22,7 @@
     attackDelayMinMs: 333,
     attackDelayMaxMs: 444,
     betweenBurstMs: 120,
-    hpResumeThresholdPct: 0.8,
+    hpResumeThresholdPct: 0.75,
     hpRefillPollMs: 500,
     hpRefillWaitTimeoutMs: 120000,
     afterKillCooldownMs: 10000,
