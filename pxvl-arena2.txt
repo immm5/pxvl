@@ -6,6 +6,7 @@
 
   const CFG = {
     startPath: "/api/arena/start",
+    upgradeBowAttackPath: "/api/character/upgrade-bow-attack",
     startTimeoutMs: 15000,
     cooldownExtraWaitMs: 15000,
     preStartAttachTimeoutMs: 5000,
@@ -575,6 +576,31 @@
     return { token: null, source: null };
   };
 
+  const upgradeBowAttack = async (token, reason = "pre-arena-start") => {
+    try {
+      const res = await fetch(CFG.upgradeBowAttackPath, {
+        method: "POST",
+        headers: {
+          accept: "*/*",
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`
+        },
+        credentials: "include",
+        body: "{}"
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        warn(`[UPGRADE] Bow attack gagal (${res.status}) [${reason}]: ${text}`);
+        return { ok: false, status: res.status, body: text };
+      }
+      log(`[UPGRADE] Bow attack berhasil [${reason}]: ${text}`);
+      return { ok: true, status: res.status, body: text };
+    } catch (err) {
+      warn(`[UPGRADE] Bow attack network error [${reason}]:`, err);
+      return { ok: false, status: null, body: String(err) };
+    }
+  };
+
   const startArena = async ({ token, autoConnect = true } = {}) => {
     if (state.startInFlight) {
       warn("start() masih berjalan. Tunggu selesai dulu.");
@@ -595,6 +621,8 @@
 
     try {
       await ensureNoActiveArenaBeforeStart();
+      log("[PREP] Upgrade bow attack sebelum arena start...");
+      await upgradeBowAttack(finalToken, "pre-start");
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CFG.startTimeoutMs);

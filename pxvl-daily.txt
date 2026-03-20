@@ -12,6 +12,7 @@
     betweenArenaAndMiningMs: 25_000,
     arena: {
       startPath: "/api/arena/start",
+      upgradeBowAttackPath: "/api/character/upgrade-bow-attack",
       startTimeoutMs: 15_000,
       cooldownExtraWaitMs: 15_000,
       preStartAttachTimeoutMs: 5_000,
@@ -865,6 +866,31 @@
       return true;
     };
 
+    const upgradeBowAttack = async (token, reason = "pre-arena-start") => {
+      try {
+        const res = await fetch(cfg.upgradeBowAttackPath, {
+          method: "POST",
+          headers: {
+            accept: "*/*",
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`
+          },
+          credentials: "include",
+          body: "{}"
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          warn(`[UPGRADE] Bow attack failed (${res.status}) [${reason}]: ${text}`);
+          return { ok: false, status: res.status, body: text };
+        }
+        log(`[UPGRADE] Bow attack success [${reason}]: ${text}`);
+        return { ok: true, status: res.status, body: text };
+      } catch (err) {
+        warn(`[UPGRADE] Bow attack network error [${reason}]:`, err);
+        return { ok: false, status: null, body: String(err) };
+      }
+    };
+
     const finishDaily = (reason, extra = null) => {
       if (!state.dailyInProgress) return;
       state.dailyInProgress = false;
@@ -989,6 +1015,8 @@
 
       try {
         await ensureNoActiveArenaBeforeStart();
+        log("[PREP] Upgrade bow attack before arena start...");
+        await upgradeBowAttack(finalToken, "pre-start");
 
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), cfg.startTimeoutMs);
