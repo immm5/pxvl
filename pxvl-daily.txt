@@ -13,6 +13,7 @@
     arena: {
       startPath: "/api/arena/start",
       upgradeBowAttackPath: "/api/character/upgrade-bow-attack",
+      upgradeMiningEfficiencyPath: "/api/character/upgrade-mining-efficiency",
       startTimeoutMs: 15_000,
       cooldownExtraWaitMs: 15_000,
       preStartAttachTimeoutMs: 5_000,
@@ -866,6 +867,31 @@
       return true;
     };
 
+    const upgradeMiningEfficiency = async (token, reason = "pre-weapon-upgrade") => {
+      try {
+        const res = await fetch(cfg.upgradeMiningEfficiencyPath, {
+          method: "POST",
+          headers: {
+            accept: "*/*",
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`
+          },
+          credentials: "include",
+          body: "{}"
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          warn(`[UPGRADE] Efficiency failed (${res.status}) [${reason}]: ${text}`);
+          return { ok: false, status: res.status, body: text };
+        }
+        log(`[UPGRADE] Efficiency success [${reason}]: ${text}`);
+        return { ok: true, status: res.status, body: text };
+      } catch (err) {
+        warn(`[UPGRADE] Efficiency network error [${reason}]:`, err);
+        return { ok: false, status: null, body: String(err) };
+      }
+    };
+
     const upgradeBowAttack = async (token, reason = "pre-arena-start") => {
       try {
         const res = await fetch(cfg.upgradeBowAttackPath, {
@@ -1015,6 +1041,8 @@
 
       try {
         await ensureNoActiveArenaBeforeStart();
+        log("[PREP] Upgrade efficiency before weapon upgrade...");
+        await upgradeMiningEfficiency(finalToken, "pre-weapon");
         log("[PREP] Upgrade bow attack before arena start...");
         await upgradeBowAttack(finalToken, "pre-start");
 
