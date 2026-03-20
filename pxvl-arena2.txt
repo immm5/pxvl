@@ -28,6 +28,11 @@
     afterKillCooldownMs: 10000,
     chainAttackMaxDistance: 2,
     cooldownThreatDistance: 2,
+    approachThreatRadius: 2,
+    maxAdditionalThreatForEngage: 0,
+    fallbackAdditionalThreatForEngage: 1,
+    safeEngageStallCycles: 10,
+    crowdRepositionWaitMs: 350,
     positionDelayMs: 60,
     acquireTimeoutMs: 8000
   };
@@ -648,6 +653,98 @@
     return Math.abs(mx - state.playerPos.x) + Math.abs(my - state.playerPos.y);
   };
 
+  const distanceBetween = (a, b) => {
+    if (!a || !b) return Number.POSITIVE_INFINITY;
+    return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+  };
+
+  const samePos = (a, b) => Boolean(a && b && a.x === b.x && a.y === b.y);
+  const getMonsterPos = (monster) => toPos(monster?.tileX, monster?.tileY);
+
+  const countNearbyThreatAtPos = (pos, excludedIndex = null) => {
+    if (!pos) return Number.POSITIVE_INFINITY;
+    let count = 0;
+    for (const { index, m } of getAliveMonsters()) {
+      if (excludedIndex !== null && index === excludedIndex) continue;
+      const mp = getMonsterPos(m);
+      if (!mp) continue;
+      if (distanceBetween(pos, mp) <= CFG.approachThreatRadius) count += 1;
+    }
+    return count;
+  };
+
+  const buildApproachCandidates = (targetPos) => {
+    if (!targetPos) return [];
+    const raw = [
+      { x: targetPos.x, y: targetPos.y + 1 },
+      { x: targetPos.x + 1, y: targetPos.y },
+      { x: targetPos.x, y: targetPos.y - 1 },
+      { x: targetPos.x - 1, y: targetPos.y },
+      { x: targetPos.x, y: targetPos.y }
+    ];
+    if (state.playerPos && distanceBetween(state.playerPos, targetPos) <= 1) {
+      raw.unshift({ x: state.playerPos.x, y: state.playerPos.y });
+    }
+
+    const seen = new Set();
+    const unique = [];
+    for (const p of raw) {
+      const key = `${p.x},${p.y}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(p);
+    }
+    return unique;
+  };
+
+  const pickBestApproachForTarget = (targetIndex) => {
+    const target = state.latestArena?.monsters?.[targetIndex];
+    const targetPos = getMonsterPos(target);
+    if (!targetPos) return null;
+
+    const homePos = { x: CFG.initialPosition.gridX, y: CFG.initialPosition.gridY };
+    const candidates = buildApproachCandidates(targetPos);
+    if (!candidates.length) return null;
+
+    let best = null;
+    for (const pos of candidates) {
+      const additionalThreat = countNearbyThreatAtPos(pos, targetIndex);
+      const travel = distanceBetween(state.playerPos, pos);
+      const targetDistance = distanceBetween(pos, targetPos);
+      const homeDistance = distanceBetween(pos, homePos);
+      const sameTilePenalty = targetDistance === 0 ? 250 : 0;
+      const score = (
+        additionalThreat * 1_000
+        + targetDistance * 100
+        + sameTilePenalty
+        + (Number.isFinite(travel) ? travel : 0) * 10
+        + homeDistance
+      );
+      const candidate = { pos, additionalThreat, targetDistance, score };
+      if (!best || candidate.score < best.score) best = candidate;
+    }
+    return best;
+  };
+
+  const pickBestEngageTarget = (engageThreatLimit = CFG.maxAdditionalThreatForEngage) => {
+    const alive = getAliveMonsters();
+    if (!alive.length) return null;
+    let best = null;
+
+    for (const entry of alive) {
+      const approach = pickBestApproachForTarget(entry.index);
+      if (!approach) continue;
+      const crowdPenalty = approach.additionalThreat > engageThreatLimit
+        ? (approach.additionalThreat - engageThreatLimit) * 5_000
+        : 0;
+      const score = approach.score + crowdPenalty;
+      const candidate = { ...entry, approach, score };
+      if (!best || candidate.score < best.score) best = candidate;
+    }
+
+    return best;
+  };
+
   const pickNearestAliveMonster = () => {
     const alive = getAliveMonsters();
     if (!alive.length) return null;
@@ -807,15 +904,46 @@
         warn("Socket arena belum open. Jalankan pvArena2.start() atau pvArena2.connect().");
         return;
       }
+      let noSafeEngageCycles = 0;
 
       while (!state.stopped && loopSocketGeneration === state.socketGeneration) {
-        const nearest = pickNearestAliveMonster();
-        if (!nearest) {
+        let engageThreatLimit = CFG.maxAdditionalThreatForEngage;
+        let targetChoice = pickBestEngageTarget(engageThreatLimit);
+        if (!targetChoice) {
           await sleep(120);
           continue;
         }
 
-        const targetIndex = nearest.index;
+        if (targetChoice.approach.additionalThreat > engageThreatLimit) {
+          noSafeEngageCycles += 1;
+          const shouldFallback = noSafeEngageCycles >= CFG.safeEngageStallCycles;
+          if (shouldFallback) {
+            engageThreatLimit = Math.max(CFG.fallbackAdditionalThreatForEngage, CFG.maxAdditionalThreatForEngage);
+            const relaxed = pickBestEngageTarget(engageThreatLimit);
+            if (relaxed && relaxed.approach.additionalThreat <= engageThreatLimit) {
+              targetChoice = relaxed;
+              noSafeEngageCycles = 0;
+              log(
+                `[RISK] Anti-stall fallback: tidak ada target full-aman selama ${CFG.safeEngageStallCycles} siklus. ` +
+                `Pakai threat limit ${engageThreatLimit} untuk target ${targetChoice.index}.`
+              );
+            }
+          }
+        } else {
+          noSafeEngageCycles = 0;
+        }
+
+        if (targetChoice.approach.additionalThreat > engageThreatLimit) {
+          send({ type: "position", gridX: CFG.initialPosition.gridX, gridY: CFG.initialPosition.gridY });
+          log(
+            `[RISK] Tahan engage. Target ${targetChoice.index} punya threat sekitar=${targetChoice.approach.additionalThreat} ` +
+            `(max ${engageThreatLimit}). Reposition ke home.`
+          );
+          await sleep(CFG.crowdRepositionWaitMs);
+          continue;
+        }
+
+        const targetIndex = targetChoice.index;
         while (!state.stopped && loopSocketGeneration === state.socketGeneration) {
           const target = state.latestArena?.monsters?.[targetIndex];
           if (!target || Number(target.hp) <= 0) {
@@ -825,7 +953,22 @@
             break;
           }
 
-          if (!send({ type: "position", gridX: target.tileX, gridY: target.tileY })) {
+          const targetPos = getMonsterPos(target);
+          const approach = pickBestApproachForTarget(targetIndex);
+          if (!targetPos || !approach) break;
+
+          const currentTargetDistance = distanceBetween(state.playerPos, targetPos);
+          const tooCrowdedToReposition = (
+            approach.additionalThreat > engageThreatLimit
+            && (!Number.isFinite(currentTargetDistance) || currentTargetDistance > 1)
+          );
+          if (tooCrowdedToReposition) break;
+
+          if (!samePos(state.playerPos, approach.pos) && !send({
+            type: "position",
+            gridX: approach.pos.x,
+            gridY: approach.pos.y
+          })) {
             if (loopSocketGeneration !== state.socketGeneration) break;
             await sleep(300);
             continue;
