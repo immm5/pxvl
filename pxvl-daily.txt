@@ -32,7 +32,9 @@
       afterKillCooldownMs: 10_000,
       chainAttackMaxDistance: 2,
       cooldownThreatDistance: 2,
-      approachThreatRadius: 2,
+      approachThreatRadius: 3,
+      approachDirectionalRadius: 6,
+      approachDirectionalPenalty: 120,
       maxAdditionalThreatForEngage: 0,
       fallbackAdditionalThreatForEngage: 1,
       safeEngageStallCycles: 10,
@@ -204,12 +206,62 @@
       dailyResolve: null,
       cooldownRetryTimer: null,
       cooldownRetryAt: null,
-      awaitingActiveArena: false
+      awaitingActiveArena: false,
+      lastBattleOutcome: null
     };
 
     const parseNumber = (value) => {
       const n = Number(value);
       return Number.isFinite(n) ? n : null;
+    };
+
+    const setBattleOutcomeFromMessage = (data) => {
+      if (data?.victory === true) {
+        state.lastBattleOutcome = {
+          type: "victory",
+          playerHp: parseNumber(data.playerHp ?? state.latestArena?.playerHp),
+          xpGained: parseNumber(data.xpGained),
+          cooldownUntil: typeof data?.cooldownUntil === "string" ? data.cooldownUntil : null,
+          at: new Date().toISOString()
+        };
+        return;
+      }
+
+      if (data?.defeat === true) {
+        state.lastBattleOutcome = {
+          type: "defeat",
+          playerHp: parseNumber(data.playerHp ?? state.latestArena?.playerHp),
+          xpGained: parseNumber(data.xpGained),
+          cooldownUntil: typeof data?.cooldownUntil === "string" ? data.cooldownUntil : null,
+          at: new Date().toISOString()
+        };
+        return;
+      }
+
+      if (data?.error === "cooldown" && typeof data?.cooldownUntil === "string") {
+        if (!state.lastBattleOutcome || state.lastBattleOutcome.type === "cooldown") {
+          state.lastBattleOutcome = {
+            type: "cooldown",
+            playerHp: parseNumber(data.playerHp ?? state.latestArena?.playerHp),
+            xpGained: null,
+            cooldownUntil: data.cooldownUntil,
+            at: new Date().toISOString()
+          };
+        }
+      }
+    };
+
+    const formatBattleOutcomeForLog = (outcome) => {
+      if (!outcome) return "result=UNKNOWN";
+      const parts = [];
+      if (outcome.type === "victory") parts.push("result=WIN");
+      else if (outcome.type === "defeat") parts.push("result=LOSE");
+      else parts.push("result=COOLDOWN");
+
+      if (Number.isFinite(outcome.playerHp)) parts.push(`playerHp=${outcome.playerHp}`);
+      if (Number.isFinite(outcome.xpGained)) parts.push(`xp=${outcome.xpGained}`);
+      if (outcome.cooldownUntil) parts.push(`cooldownUntil=${outcome.cooldownUntil}`);
+      return parts.join(" | ");
     };
 
     const isArenaUrl = (url) => {
@@ -262,6 +314,7 @@
     const parseIncoming = (raw) => {
       const data = safeJson(typeof raw === "string" ? raw : String(raw));
       if (!data || typeof data !== "object") return;
+      setBattleOutcomeFromMessage(data);
       if (Array.isArray(data.monsters)) {
         state.latestArena = data;
         updatePlayerPosFromState(data);
@@ -339,10 +392,14 @@
     const buildApproachCandidates = (targetPos) => {
       if (!targetPos) return [];
       const raw = [
+        { x: targetPos.x + 1, y: targetPos.y + 1 },
         { x: targetPos.x, y: targetPos.y + 1 },
         { x: targetPos.x + 1, y: targetPos.y },
+        { x: targetPos.x + 1, y: targetPos.y - 1 },
         { x: targetPos.x, y: targetPos.y - 1 },
         { x: targetPos.x - 1, y: targetPos.y },
+        { x: targetPos.x - 1, y: targetPos.y - 1 },
+        { x: targetPos.x - 1, y: targetPos.y + 1 },
         { x: targetPos.x, y: targetPos.y }
       ];
       if (state.playerPos && distanceBetween(state.playerPos, targetPos) <= 1) {
@@ -360,6 +417,31 @@
       return unique;
     };
 
+    const countDirectionalThreatTowardOthers = (targetIndex, targetPos, approachPos) => {
+      if (!targetPos || !approachPos) return 0;
+      const approachVector = { x: approachPos.x - targetPos.x, y: approachPos.y - targetPos.y };
+      if (approachVector.x === 0 && approachVector.y === 0) return 0;
+
+      let risk = 0;
+      for (const { index, m } of getAliveMonsters()) {
+        if (index === targetIndex) continue;
+        const mp = getMonsterPos(m);
+        if (!mp) continue;
+
+        const distToTarget = distanceBetween(targetPos, mp);
+        if (!Number.isFinite(distToTarget) || distToTarget > cfg.approachDirectionalRadius) continue;
+
+        const monsterVector = { x: mp.x - targetPos.x, y: mp.y - targetPos.y };
+        const alignment = approachVector.x * monsterVector.x + approachVector.y * monsterVector.y;
+        if (alignment <= 0) continue;
+
+        const proximityWeight = cfg.approachDirectionalRadius - distToTarget + 1;
+        risk += alignment * proximityWeight;
+      }
+
+      return risk;
+    };
+
     const pickBestApproachForTarget = (targetIndex) => {
       const target = state.latestArena?.monsters?.[targetIndex];
       const targetPos = getMonsterPos(target);
@@ -375,15 +457,17 @@
         const travel = distanceBetween(state.playerPos, pos);
         const targetDistance = distanceBetween(pos, targetPos);
         const homeDistance = distanceBetween(pos, homePos);
+        const directionalRisk = countDirectionalThreatTowardOthers(targetIndex, targetPos, pos);
         const sameTilePenalty = targetDistance === 0 ? 250 : 0;
         const score = (
           additionalThreat * 1_000
+          + directionalRisk * cfg.approachDirectionalPenalty
           + targetDistance * 100
           + sameTilePenalty
           + (Number.isFinite(travel) ? travel : 0) * 10
           + homeDistance
         );
-        const candidate = { pos, additionalThreat, targetDistance, score };
+        const candidate = { pos, additionalThreat, directionalRisk, targetDistance, score };
         if (!best || candidate.score < best.score) best = candidate;
       }
       return best;
@@ -711,6 +795,7 @@
         ws.__pvDailySkipRestart = true;
         ws.addEventListener("open", () => {
           state.activeSocket = ws;
+          state.lastBattleOutcome = null;
           log("WSS attached from performance:", perfUrl);
           sendInitialPositionOnce();
           runLoop();
@@ -849,7 +934,13 @@
     const handleSocketClose = (ev, ws) => {
       if (state.activeSocket === ws) state.activeSocket = null;
       state.runningLoop = false;
-      log("WSS close:", ev?.code ?? "?", ev?.reason || "(no reason)");
+      log(
+        "WSS close:",
+        ev?.code ?? "?",
+        ev?.reason || "(no reason)",
+        "|",
+        formatBattleOutcomeForLog(state.lastBattleOutcome)
+      );
       if (!ws.__pvDailySkipRestart) {
         maybeAutoRestartAfterClose();
       }
@@ -869,6 +960,7 @@
       const ws = new WebSocket(url);
       ws.addEventListener("open", () => {
         state.activeSocket = ws;
+        state.lastBattleOutcome = null;
         log("WSS open:", url);
         sendInitialPositionOnce();
         runLoop();
@@ -1033,7 +1125,8 @@
       wsReadyState: state.activeSocket?.readyState ?? null,
       awaitingActiveArena: state.awaitingActiveArena,
       cooldownRetryAt: state.cooldownRetryAt,
-      cooldownRetryScheduled: Boolean(state.cooldownRetryTimer)
+      cooldownRetryScheduled: Boolean(state.cooldownRetryTimer),
+      lastBattleOutcome: state.lastBattleOutcome
     });
 
     return {
