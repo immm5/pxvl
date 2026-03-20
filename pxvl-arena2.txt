@@ -26,6 +26,7 @@
     hpRefillPollMs: 500,
     hpRefillWaitTimeoutMs: 120000,
     afterKillCooldownMs: 10000,
+    chainAttackMaxDistance: 2,
     positionDelayMs: 60,
     acquireTimeoutMs: 8000
   };
@@ -674,6 +675,18 @@
   };
 
   const afterMonsterKilledTransition = async (killedIndex) => {
+    const nearby = pickNearestAliveMonsterExcluding(killedIndex);
+    if (nearby) {
+      const dist = distanceToPlayer(nearby.m);
+      if (Number.isFinite(dist) && dist <= CFG.chainAttackMaxDistance) {
+        log(
+          `Monster ${killedIndex} mati. Monster dekat ${nearby.index} distance=${dist} ` +
+          `<= ${CFG.chainAttackMaxDistance}, lanjut chain attack sebelum cooldown.`
+        );
+        return;
+      }
+    }
+
     send({ type: "position", gridX: CFG.initialPosition.gridX, gridY: CFG.initialPosition.gridY });
     log(`Monster ${killedIndex} mati. Return ke home (${CFG.initialPosition.gridX},${CFG.initialPosition.gridY}).`);
 

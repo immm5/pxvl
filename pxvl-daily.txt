@@ -26,10 +26,12 @@
       attackDelayMinMs: 111,
       attackDelayMaxMs: 166,
       betweenBurstMs: 132,
-      hpResumeThresholdPct: 0.75,
+      hpResumeThresholdPct: 0.8,
       hpRefillPollMs: 500,
       hpRefillWaitTimeoutMs: 120_000,
       afterKillCooldownMs: 10_000,
+      chainAttackMaxDistance: 2,
+      cooldownThreatDistance: 2,
       positionDelayMs: 60,
       acquireTimeoutMs: 8_000
     },
@@ -325,6 +327,16 @@
       return alive[0];
     };
 
+    const pickNearbyAliveMonster = (maxDistance, excludedIndex = null) => {
+      const nearest = excludedIndex === null
+        ? pickNearestAliveMonster()
+        : pickNearestAliveMonsterExcluding(excludedIndex);
+      if (!nearest) return null;
+      const distance = distanceToPlayer(nearest.m);
+      if (!Number.isFinite(distance) || distance > maxDistance) return null;
+      return { ...nearest, distance };
+    };
+
     const acquireSocket = async () => {
       const startAt = Date.now();
       while (!state.stopped && Date.now() - startAt < cfg.acquireTimeoutMs) {
@@ -338,6 +350,15 @@
     };
 
     const afterMonsterKilledTransition = async (killedIndex) => {
+      const nearby = pickNearbyAliveMonster(cfg.chainAttackMaxDistance, killedIndex);
+      if (nearby) {
+        log(
+          `Monster ${killedIndex} dead. Nearby monster ${nearby.index} distance=${nearby.distance} ` +
+          `<= ${cfg.chainAttackMaxDistance}, chain attack before cooldown.`
+        );
+        return;
+      }
+
       send({ type: "position", gridX: cfg.initialPosition.gridX, gridY: cfg.initialPosition.gridY });
       log(`Monster ${killedIndex} dead. Return home (${cfg.initialPosition.gridX},${cfg.initialPosition.gridY}).`);
 
@@ -359,8 +380,25 @@
       };
 
       const waitStartAt = Date.now();
+      let prevHpRatio = getPlayerHpRatio();
       while (!state.stopped) {
         const ratio = getPlayerHpRatio();
+        const closeThreat = pickNearbyAliveMonster(cfg.cooldownThreatDistance);
+        const hpDropped = ratio !== null && prevHpRatio !== null && ratio + 0.0001 < prevHpRatio;
+        if (closeThreat) {
+          log(
+            `[DEFENSE] Cooldown prep interrupted. Monster ${closeThreat.index} ` +
+            `distance=${closeThreat.distance} <= ${cfg.cooldownThreatDistance}. Retaliating now.`
+          );
+          return;
+        }
+        if (hpDropped) {
+          const retaliation = pickNearestAliveMonster();
+          if (retaliation) {
+            log(`[DEFENSE] HP dropped during cooldown prep. Retaliate monster ${retaliation.index}.`);
+            return;
+          }
+        }
         if (ratio === null) {
           warn("HP data unavailable; skip HP wait.");
           break;
@@ -376,12 +414,38 @@
           );
           break;
         }
+        prevHpRatio = ratio;
         await sleep(cfg.hpRefillPollMs);
       }
 
       if (state.stopped) return;
       log(`Cooldown between monsters: ${cfg.afterKillCooldownMs}ms`);
-      await sleep(cfg.afterKillCooldownMs);
+      const cooldownStartAt = Date.now();
+      let cooldownPrevHpRatio = getPlayerHpRatio();
+      while (!state.stopped && Date.now() - cooldownStartAt < cfg.afterKillCooldownMs) {
+        const ratio = getPlayerHpRatio();
+        const closeThreat = pickNearbyAliveMonster(cfg.cooldownThreatDistance);
+        const hpDropped = ratio !== null && cooldownPrevHpRatio !== null && ratio + 0.0001 < cooldownPrevHpRatio;
+        if (closeThreat) {
+          log(
+            `[DEFENSE] Cooldown interrupted. Monster ${closeThreat.index} ` +
+            `distance=${closeThreat.distance} <= ${cfg.cooldownThreatDistance}. Retaliating now.`
+          );
+          return;
+        }
+        if (hpDropped) {
+          const retaliation = pickNearestAliveMonster();
+          if (retaliation) {
+            log(`[DEFENSE] HP dropped during cooldown. Retaliate monster ${retaliation.index}.`);
+            return;
+          }
+        }
+        if (ratio !== null) cooldownPrevHpRatio = ratio;
+        const elapsed = Date.now() - cooldownStartAt;
+        const remaining = Math.max(0, cfg.afterKillCooldownMs - elapsed);
+        if (!remaining) break;
+        await sleep(Math.min(cfg.hpRefillPollMs, remaining));
+      }
     };
 
     async function runLoop() {
