@@ -1,7 +1,7 @@
 (() => {
   const BUILD_META = {
-    version: "v1.0.0",
-    lastUpdated: "2026-03-24 00:24:53 ICT"
+    version: "v1.0.1",
+    lastUpdated: "2026-03-24 00:30:46 ICT"
   };
 
   if (window.pvDaily) {
@@ -73,12 +73,20 @@
         body: JSON.stringify(totals)
       });
       const sellText = await sellRes.text();
+      const sellData = (() => {
+        try { return JSON.parse(sellText); } catch { return null; }
+      })();
+      const yourPoints = Number(sellData?.window?.yourPoints ?? sellData?.sale?.points);
+      const totalPoints = Number(sellData?.window?.totalPoints);
+      const pointsInfo = Number.isFinite(yourPoints)
+        ? ` | Points ${yourPoints}/${Number.isFinite(totalPoints) ? totalPoints : "?"}`
+        : "";
       if (!sellRes.ok) {
         console.warn(`[pvDaily] sell_all failed (${sellRes.status}):`, sellText);
-        return { ok: false, sold: false, status: sellRes.status, body: sellText, payload: totals };
+        return { ok: false, sold: false, status: sellRes.status, body: sellText, data: sellData, payload: totals };
       }
-      console.log(`[pvDaily] sell_all sold gold=${totals.gold}, silver=${totals.silver}, bronze=${totals.bronze}.`);
-      return { ok: true, sold: true, status: sellRes.status, body: sellText, payload: totals };
+      console.log(`[pvDaily] sell_all sold gold=${totals.gold}, silver=${totals.silver}, bronze=${totals.bronze}.${pointsInfo}`);
+      return { ok: true, sold: true, status: sellRes.status, body: sellText, data: sellData, payload: totals };
     };
 
     window.pvDaily.sellAll = fallbackSellAll;
@@ -1344,6 +1352,13 @@
       return totals;
     };
 
+    const salePointsInfo = (sellData) => {
+      const yourPoints = Number(sellData?.window?.yourPoints ?? sellData?.sale?.points);
+      const totalPoints = Number(sellData?.window?.totalPoints);
+      if (!Number.isFinite(yourPoints)) return "";
+      return ` | Points ${yourPoints}/${Number.isFinite(totalPoints) ? totalPoints : "?"}`;
+    };
+
     const fetchCharacter = async (token) => {
       try {
         const res = await fetch("/api/character", {
@@ -1425,13 +1440,14 @@
           body: JSON.stringify(payload)
         });
         const text = await res.text();
+        const data = safeJson(text);
         if (!res.ok) {
           warn(`[SELL] Failed (${res.status}): ${text}`);
           return { ok: false, sold: false };
         }
-        log(`[SELL] Sold silver=${payload.silver}, bronze=${payload.bronze}.`);
+        log(`[SELL] Sold silver=${payload.silver}, bronze=${payload.bronze}.${salePointsInfo(data)}`);
         await upgradeMiningEfficiency(token, "post-sell");
-        return { ok: true, sold: true };
+        return { ok: true, sold: true, status: res.status, body: text, data };
       } catch (err) {
         warn("[SELL] Network error:", err);
         return { ok: false, sold: false };
@@ -1474,13 +1490,17 @@
           body: JSON.stringify(payload)
         });
         const text = await res.text();
+        const data = safeJson(text);
         if (!res.ok) {
           warn(`[SELL-ALL] Failed (${res.status}) [${reason}]: ${text}`);
-          return { ok: false, sold: false, status: res.status, body: text, payload };
+          return { ok: false, sold: false, status: res.status, body: text, data, payload };
         }
 
-        log(`[SELL-ALL] Sold gold=${payload.gold}, silver=${payload.silver}, bronze=${payload.bronze} [${reason}].`);
-        return { ok: true, sold: true, status: res.status, body: text, payload };
+        log(
+          `[SELL-ALL] Sold gold=${payload.gold}, silver=${payload.silver}, bronze=${payload.bronze} ` +
+          `[${reason}].${salePointsInfo(data)}`
+        );
+        return { ok: true, sold: true, status: res.status, body: text, data, payload };
       } catch (err) {
         warn(`[SELL-ALL] Network error [${reason}]:`, err);
         return { ok: false, sold: false, status: null, body: String(err), payload };
