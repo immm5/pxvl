@@ -1354,6 +1354,55 @@
       }
     };
 
+    const sellAllInventory = async (reason = "manual_sell_all") => {
+      const token = getToken();
+      if (!token) {
+        warn(`[SELL-ALL] Token missing [${reason}]`);
+        return { ok: false, sold: false, error: "token_missing" };
+      }
+
+      const charData = await fetchCharacter(token);
+      if (!charData) {
+        warn(`[SELL-ALL] Failed to fetch character [${reason}]`);
+        return { ok: false, sold: false, error: "character_fetch_failed" };
+      }
+
+      const totals = sumResources(charData?.slots || []);
+      if (!totals.gold && !totals.silver && !totals.bronze) {
+        log(`[SELL-ALL] Nothing to sell [${reason}].`);
+        return { ok: true, sold: false, totals };
+      }
+
+      const payload = {
+        gold: totals.gold,
+        silver: totals.silver,
+        bronze: totals.bronze
+      };
+
+      try {
+        const res = await fetch("/api/market/sell", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify(payload)
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          warn(`[SELL-ALL] Failed (${res.status}) [${reason}]: ${text}`);
+          return { ok: false, sold: false, status: res.status, body: text, payload };
+        }
+
+        log(`[SELL-ALL] Sold gold=${payload.gold}, silver=${payload.silver}, bronze=${payload.bronze} [${reason}].`);
+        return { ok: true, sold: true, status: res.status, body: text, payload };
+      } catch (err) {
+        warn(`[SELL-ALL] Network error [${reason}]:`, err);
+        return { ok: false, sold: false, status: null, body: String(err), payload };
+      }
+    };
+
     const maybeAutoSell = async (token, snapshot) => {
       const capacity = getCapacity(snapshot);
       const used = getBagUsed(snapshot);
@@ -1644,7 +1693,8 @@
     return {
       runDaily,
       stop,
-      status
+      status,
+      sellAllInventory
     };
   }
 
@@ -1882,15 +1932,23 @@
     mining: mining.status()
   });
 
+  const sellAll = async () => {
+    const result = await mining.sellAllInventory("console_command");
+    return result;
+  };
+
   window.pvDaily = {
     run,
     stop,
-    status
+    status,
+    sellAll,
+    sell_all: sellAll
   };
+  window.sell_all = sellAll;
 
   baseLog("Ready.");
   baseLog("Flow: Arena daily -> wait 60s -> Mining daily -> complete log.");
-  baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status()");
+  baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status(), pvDaily.sell_all(), sell_all()");
 
   if (CFG.autoRerunWindowEnabled) {
     scheduleNextAutoRerun("init");
