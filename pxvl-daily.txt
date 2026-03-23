@@ -46,10 +46,13 @@
     },
     mining: {
       mode: "normal", // normal / fast
+      mapId: "map2",
       rockMin: 0,
       rockMax: 5,
       sellEverySuccess: 25,
-      lowCapacityFreeSlotTrigger: 4
+      lowCapacityFreeSlotTrigger: 4,
+      rocksSnapshotPath: "/api/mining/rocks",
+      allRocksEmptyWaitMs: 600_000
     }
   };
 
@@ -1205,8 +1208,7 @@
       resolve: null
     };
 
-    let rockIndex = cfg.rockMin;
-    let invalidRocks = new Set();
+    let rockIndex = null;
     let successCount = 0;
     let nextSellAt = cfg.sellEverySuccess;
     let lastNearFullSellAttemptAt = 0;
@@ -1232,11 +1234,6 @@
       }
       state.resolve = null;
       state.promise = null;
-    };
-
-    const nextRock = () => {
-      rockIndex += 1;
-      if (rockIndex > cfg.rockMax) rockIndex = cfg.rockMin;
     };
 
     const getCapacity = (snapshot) => Number(snapshot?.character?.capacity ?? snapshot?.capacity ?? 0);
@@ -1407,6 +1404,61 @@
       return latest || fallbackSnapshot;
     };
 
+    const fetchRocksSnapshot = async (token) => {
+      try {
+        const url = `${cfg.rocksSnapshotPath}?mapId=${encodeURIComponent(cfg.mapId)}`;
+        const res = await fetch(url, {
+          credentials: "include",
+          headers: {
+            accept: "*/*",
+            Authorization: `Bearer ${token}`
+          }
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          warn(`[ROCK] Snapshot failed (${res.status}): ${text}`);
+          return null;
+        }
+        const data = safeJson(text);
+        if (!data || typeof data !== "object" || !Array.isArray(data.rocks)) {
+          warn("[ROCK] Snapshot invalid payload:", data);
+          return null;
+        }
+        return data.rocks;
+      } catch (err) {
+        warn("[ROCK] Snapshot network error:", err);
+        return null;
+      }
+    };
+
+    const pickRandomAliveRock = async (token, reason = "unspecified") => {
+      const rocks = await fetchRocksSnapshot(token);
+      if (!rocks) return { ok: false, waitMs: 5_000 };
+
+      const available = rocks
+        .filter((r) => {
+          const idx = Number(r?.rockIndex);
+          const hp = Number(r?.healthPct);
+          return Number.isInteger(idx)
+            && idx >= cfg.rockMin
+            && idx <= cfg.rockMax
+            && Number.isFinite(hp)
+            && hp > 0;
+        })
+        .map((r) => ({ rockIndex: Number(r.rockIndex), healthPct: Number(r.healthPct) }));
+
+      if (!available.length) {
+        rockIndex = null;
+        log(`[ROCK] All rocks healthPct=0. Wait ${Math.ceil(cfg.allRocksEmptyWaitMs / 60000)}m before retry.`);
+        return { ok: false, waitMs: cfg.allRocksEmptyWaitMs, allDepleted: true };
+      }
+
+      const picked = available[randInt(0, available.length - 1)];
+      rockIndex = picked.rockIndex;
+      log(`[ROCK] Selected rock ${rockIndex} from snapshot [${reason}] (healthPct=${picked.healthPct}).`);
+      return { ok: true, rockIndex: picked.rockIndex, healthPct: picked.healthPct };
+    };
+
     const evaluateLimitsOrStop = async (token, fallbackSnapshot) => {
       const latest = await getLatestSnapshot(token, fallbackSnapshot);
       if (!latest) return;
@@ -1451,6 +1503,15 @@
         return;
       }
 
+      if (!Number.isInteger(rockIndex) || rockIndex < cfg.rockMin || rockIndex > cfg.rockMax) {
+        const selected = await pickRandomAliveRock(token, "no_current_target");
+        if (!selected.ok) {
+          if (!state.running) return;
+          setTimeout(hitLoop, selected.waitMs);
+          return;
+        }
+      }
+
       try {
         const res = await fetch("/api/mining/hit", {
           method: "POST",
@@ -1460,7 +1521,7 @@
             Authorization: `Bearer ${token}`
           },
           body: JSON.stringify({
-            mapId: "map2",
+            mapId: cfg.mapId,
             rockIndex
           })
         });
@@ -1481,23 +1542,20 @@
             setTimeout(hitLoop, 1_000);
             return;
           }
-
-          log(`[HIT] Rock ${rockIndex} unavailable (${res.status}) ${raw ? `| ${raw}` : ""}`);
-          invalidRocks.add(rockIndex);
-          nextRock();
-
-          if (invalidRocks.size >= (cfg.rockMax - cfg.rockMin + 1)) {
-            log("[WAIT] All rocks invalid. Wait 60s...");
-            invalidRocks.clear();
-            setTimeout(hitLoop, 60_000);
+          if (errBody?.error === "rock_depleted") {
+            log(`[ROCK] Rock ${rockIndex} already depleted (non-200 response). Pick another rock.`);
+            rockIndex = null;
+            setTimeout(hitLoop, 1_000);
             return;
           }
+
+          log(`[HIT] Rock ${rockIndex} unavailable (${res.status}) ${raw ? `| ${raw}` : ""}`);
+          rockIndex = null;
 
           setTimeout(hitLoop, 1_000);
           return;
         }
 
-        invalidRocks.delete(rockIndex);
         const data = await res.json();
         if (data?.error === "daily_limit_reached") {
           stop("daily_limit_reached");
@@ -1507,6 +1565,12 @@
           log("[BAG] Mining response returned inventory_full. Checking bag state...");
           await evaluateLimitsOrStop(token);
           if (!state.running) return;
+          setTimeout(hitLoop, 1_000);
+          return;
+        }
+        if (data?.error === "rock_depleted") {
+          log(`[ROCK] Rock ${rockIndex} depleted. Pick another rock.`);
+          rockIndex = null;
           setTimeout(hitLoop, 1_000);
           return;
         }
@@ -1525,8 +1589,7 @@
 
         if (data.rockHealthPct <= 0) {
           log(`[ROCK] Rock ${rockIndex} destroyed`);
-          invalidRocks.add(rockIndex);
-          nextRock();
+          rockIndex = null;
         }
       } catch (err) {
         warn("[HIT] Network error:", err);
@@ -1546,8 +1609,7 @@
         state.resolve = resolve;
       });
 
-      rockIndex = cfg.rockMin;
-      invalidRocks = new Set();
+      rockIndex = null;
       successCount = 0;
       nextSellAt = cfg.sellEverySuccess;
       lastNearFullSellAttemptAt = 0;
