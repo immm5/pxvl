@@ -1,6 +1,82 @@
 (() => {
   if (window.pvDaily) {
     console.warn("pvDaily already loaded.");
+    if (typeof window.pvDaily.sell_all === "function") {
+      window.sell_all = window.pvDaily.sell_all;
+      console.log("[pvDaily] Alias ready: sell_all()");
+      return;
+    }
+    if (typeof window.pvDaily.sellAll === "function") {
+      window.pvDaily.sell_all = window.pvDaily.sellAll;
+      window.sell_all = window.pvDaily.sellAll;
+      console.log("[pvDaily] Alias ready: sell_all()");
+      return;
+    }
+
+    const normalize = (raw) => (raw ? String(raw).replace(/^Bearer\s+/i, "").trim() : "");
+    const maybeToken = (value) => {
+      const t = normalize(value);
+      if (!t || t.length < 20 || /\s/.test(t)) return "";
+      return t;
+    };
+    const detectTokenFallback = () =>
+      maybeToken(
+        localStorage.getItem("pixelvalley_token")
+        || localStorage.getItem("token")
+        || sessionStorage.getItem("pixelvalley_token")
+      );
+
+    const fallbackSellAll = async () => {
+      const token = detectTokenFallback();
+      if (!token) {
+        console.warn("[pvDaily] sell_all token missing.");
+        return { ok: false, sold: false, error: "token_missing" };
+      }
+
+      const charRes = await fetch("/api/character", {
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!charRes.ok) {
+        const text = await charRes.text();
+        console.warn(`[pvDaily] sell_all character fetch failed (${charRes.status}):`, text);
+        return { ok: false, sold: false, status: charRes.status, body: text };
+      }
+
+      const data = await charRes.json();
+      const totals = { gold: 0, silver: 0, bronze: 0 };
+      for (const s of (data?.slots || [])) {
+        if (Object.prototype.hasOwnProperty.call(totals, s?.resourceType)) {
+          totals[s.resourceType] += Number(s?.count || 0);
+        }
+      }
+      if (!totals.gold && !totals.silver && !totals.bronze) {
+        console.log("[pvDaily] sell_all nothing to sell.");
+        return { ok: true, sold: false, payload: totals };
+      }
+
+      const sellRes = await fetch("/api/market/sell", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(totals)
+      });
+      const sellText = await sellRes.text();
+      if (!sellRes.ok) {
+        console.warn(`[pvDaily] sell_all failed (${sellRes.status}):`, sellText);
+        return { ok: false, sold: false, status: sellRes.status, body: sellText, payload: totals };
+      }
+      console.log(`[pvDaily] sell_all sold gold=${totals.gold}, silver=${totals.silver}, bronze=${totals.bronze}.`);
+      return { ok: true, sold: true, status: sellRes.status, body: sellText, payload: totals };
+    };
+
+    window.pvDaily.sellAll = fallbackSellAll;
+    window.pvDaily.sell_all = fallbackSellAll;
+    window.sell_all = fallbackSellAll;
+    console.log("[pvDaily] Fallback sell_all injected for existing instance.");
     return;
   }
 
