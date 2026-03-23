@@ -1,6 +1,14 @@
 (() => {
+  const BUILD_META = {
+    version: "v1.0.0",
+    lastUpdated: "2026-03-24 00:24:53 ICT"
+  };
+
   if (window.pvDaily) {
     console.warn("pvDaily already loaded.");
+    const loadedVersion = window.pvDaily?.meta?.version || window.pvDaily?.version || "unknown";
+    const loadedUpdated = window.pvDaily?.meta?.lastUpdated || window.pvDaily?.lastUpdated || "unknown";
+    console.log(`[pvDaily] Loaded build: ${loadedVersion} (lastUpdated: ${loadedUpdated})`);
     if (typeof window.pvDaily.sell_all === "function") {
       window.sell_all = window.pvDaily.sell_all;
       console.log("[pvDaily] Alias ready: sell_all()");
@@ -2018,11 +2026,15 @@
     stop,
     status,
     sellAll,
-    sell_all: sellAll
+    sell_all: sellAll,
+    version: BUILD_META.version,
+    lastUpdated: BUILD_META.lastUpdated,
+    meta: { ...BUILD_META }
   };
   window.sell_all = sellAll;
 
   baseLog("Ready.");
+  baseLog(`Build: ${BUILD_META.version} | Last update: ${BUILD_META.lastUpdated}`);
   baseLog("Flow: Arena daily -> wait 60s -> Mining daily -> complete log.");
   baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status(), pvDaily.sell_all(), sell_all()");
 
