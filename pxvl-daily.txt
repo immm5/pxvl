@@ -1,7 +1,7 @@
 (() => {
   const BUILD_META = {
-    version: "v1.0.12",
-    lastUpdated: "2026-03-24 08:45:59 ICT"
+    version: "v1.0.13",
+    lastUpdated: "2026-03-24 09:33:06 ICT"
   };
 
   if (window.pvDaily) {
@@ -149,7 +149,7 @@
       sellEverySuccess: 25,
       autoSellEnabled: true,
       autoSellAfterTimeEnabled: true,
-      autoSellStartTime: { hour: 13, minute: 0 },
+      autoSellStartTime: { hour: 9, minute: 0 },
       autoPreSellBeforeMining: true,
       autoUpgradeEfficiencyBeforeMining: true,
       autoUpgradeEfficiencyAfterSell: true,
