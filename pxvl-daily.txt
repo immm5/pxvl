@@ -1,7 +1,7 @@
 (() => {
   const BUILD_META = {
-    version: "v1.0.1",
-    lastUpdated: "2026-03-24 00:30:46 ICT"
+    version: "v1.0.4",
+    lastUpdated: "2026-03-24 07:44:55 ICT"
   };
 
   if (window.pvDaily) {
@@ -99,13 +99,15 @@
   const CFG = {
     autoRunOnLoad: true,
     autoRerunWindowEnabled: true,
-    autoRerunWindowStart: { hour: 7, minute: 5 },
-    autoRerunWindowEnd: { hour: 7, minute: 30 },
-    betweenArenaAndMiningMs: 25_000,
+    autoRerunWindowStart: { hour: 7, minute: 1 },
+    autoRerunWindowEnd: { hour: 7, minute: 14 },
+    betweenArenaAndMiningMs: 4_000,
     arena: {
       startPath: "/api/arena/start",
       upgradeBowAttackPath: "/api/character/upgrade-bow-attack",
       upgradeMiningEfficiencyPath: "/api/character/upgrade-mining-efficiency",
+      autoUpgradeEfficiencyBeforeStart: true,
+      autoUpgradeWeaponBeforeStart: true,
       startTimeoutMs: 15_000,
       cooldownExtraWaitMs: 15_000,
       preStartAttachTimeoutMs: 5_000,
@@ -142,6 +144,10 @@
       rockMin: 0,
       rockMax: 5,
       sellEverySuccess: 25,
+      autoSellEnabled: true,
+      autoPreSellBeforeMining: true,
+      autoUpgradeEfficiencyBeforeMining: true,
+      autoUpgradeEfficiencyAfterSell: true,
       lowCapacityFreeSlotTrigger: 4,
       rocksSnapshotPath: "/api/mining/rocks",
       allRocksEmptyWaitMs: 600_000
@@ -1136,10 +1142,18 @@
 
       try {
         await ensureNoActiveArenaBeforeStart();
-        log("[PREP] Upgrade efficiency before weapon upgrade...");
-        await upgradeMiningEfficiency(finalToken, "pre-weapon");
-        log("[PREP] Upgrade bow attack before arena start...");
-        await upgradeBowAttack(finalToken, "pre-start");
+        if (cfg.autoUpgradeEfficiencyBeforeStart) {
+          log("[PREP] Upgrade efficiency before weapon upgrade...");
+          await upgradeMiningEfficiency(finalToken, "pre-weapon");
+        } else {
+          log("[PREP] Skip upgrade efficiency before arena (disabled by config).");
+        }
+        if (cfg.autoUpgradeWeaponBeforeStart) {
+          log("[PREP] Upgrade bow attack before arena start...");
+          await upgradeBowAttack(finalToken, "pre-start");
+        } else {
+          log("[PREP] Skip bow attack upgrade before arena (disabled by config).");
+        }
 
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), cfg.startTimeoutMs);
@@ -1446,7 +1460,11 @@
           return { ok: false, sold: false };
         }
         log(`[SELL] Sold silver=${payload.silver}, bronze=${payload.bronze}.${salePointsInfo(data)}`);
-        await upgradeMiningEfficiency(token, "post-sell");
+        if (cfg.autoUpgradeEfficiencyAfterSell) {
+          await upgradeMiningEfficiency(token, "post-sell");
+        } else {
+          log("[SELL] Skip post-sell efficiency upgrade (disabled by config).");
+        }
         return { ok: true, sold: true, status: res.status, body: text, data };
       } catch (err) {
         warn("[SELL] Network error:", err);
@@ -1508,6 +1526,7 @@
     };
 
     const maybeAutoSell = async (token, snapshot) => {
+      if (!cfg.autoSellEnabled) return;
       const capacity = getCapacity(snapshot);
       const used = getBagUsed(snapshot);
       const freeCapacity = Math.max(capacity - used, 0);
@@ -1623,6 +1642,10 @@
         const level = getLevel(latest);
         if (level < 3) {
           stop("backpack_full_level_lt_3_run_arena");
+          return;
+        }
+        if (!cfg.autoSellEnabled) {
+          stop("backpack_full_auto_sell_disabled");
           return;
         }
 
@@ -1773,11 +1796,19 @@
         return state.promise;
       }
 
-      log("[START] Upgrade mining efficiency before mining...");
-      await upgradeMiningEfficiency(token, "pre-mining");
+      if (cfg.autoUpgradeEfficiencyBeforeMining) {
+        log("[START] Upgrade mining efficiency before mining...");
+        await upgradeMiningEfficiency(token, "pre-mining");
+      } else {
+        log("[START] Skip pre-mining efficiency upgrade (disabled by config).");
+      }
 
-      log("[START] Pre-sell silver+bronze before mining...");
-      await sellSilverBronzeAll(token, null);
+      if (cfg.autoPreSellBeforeMining && cfg.autoSellEnabled) {
+        log("[START] Pre-sell silver+bronze before mining...");
+        await sellSilverBronzeAll(token, null);
+      } else {
+        log("[START] Skip pre-sell before mining (disabled by config).");
+      }
 
       const charData = await fetchCharacter(token);
       if (charData) logCharacter(charData);
@@ -2047,6 +2078,7 @@
     status,
     sellAll,
     sell_all: sellAll,
+    config: CFG,
     version: BUILD_META.version,
     lastUpdated: BUILD_META.lastUpdated,
     meta: { ...BUILD_META }
@@ -2055,8 +2087,8 @@
 
   baseLog("Ready.");
   baseLog(`Build: ${BUILD_META.version} | Last update: ${BUILD_META.lastUpdated}`);
-  baseLog("Flow: Arena daily -> wait 60s -> Mining daily -> complete log.");
-  baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status(), pvDaily.sell_all(), sell_all()");
+  baseLog(`Flow: Arena daily -> wait ${CFG.betweenArenaAndMiningMs / 1000}s -> Mining daily -> complete log.`);
+  baseLog("Commands: pvDaily.run(), pvDaily.stop(), pvDaily.status(), pvDaily.sell_all(), sell_all(), pvDaily.config");
 
   if (CFG.autoRerunWindowEnabled) {
     scheduleNextAutoRerun("init");
