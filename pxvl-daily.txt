@@ -1,7 +1,7 @@
 (() => {
   const BUILD_META = {
-    version: "v1.0.5",
-    lastUpdated: "2026-03-24 07:58:41 ICT"
+    version: "v1.0.12",
+    lastUpdated: "2026-03-24 08:45:59 ICT"
   };
 
   if (window.pvDaily) {
@@ -143,6 +143,9 @@
       mapId: "map2",
       rockMin: 0,
       rockMax: 5,
+      rocksSnapshotPath: "/api/mining/rocks",
+      allRocksEmptyWaitMs: 600_000,
+      allRocksInvalidWaitMs: 600_000,
       sellEverySuccess: 25,
       autoSellEnabled: true,
       autoSellAfterTimeEnabled: true,
@@ -150,9 +153,7 @@
       autoPreSellBeforeMining: true,
       autoUpgradeEfficiencyBeforeMining: true,
       autoUpgradeEfficiencyAfterSell: true,
-      lowCapacityFreeSlotTrigger: 4,
-      rocksSnapshotPath: "/api/mining/rocks",
-      allRocksEmptyWaitMs: 600_000
+      lowCapacityFreeSlotTrigger: 4
     }
   };
 
@@ -165,6 +166,13 @@
     } catch {
       return raw;
     }
+  };
+  const isCloudflareChallenge = (raw) => {
+    if (!raw || typeof raw !== "string") return false;
+    const text = raw.toLowerCase();
+    return text.includes("<title>just a moment")
+      || text.includes("window._cf_chl_opt")
+      || text.includes("/cdn-cgi/challenge-platform");
   };
 
   const baseLog = (...args) => console.log(`[pvDaily ${now()}]`, ...args);
@@ -1321,6 +1329,9 @@
     let nextSellAt = cfg.sellEverySuccess;
     let lastNearFullSellAttemptAt = 0;
     let timedOneShotSellTriggered = false;
+    let lastSnapshot = null;
+    let finalSummaryLogged = false;
+    let refreshTriggered = false;
 
     const getToken = () => {
       const detected = detectToken();
@@ -1329,7 +1340,7 @@
 
     const getDelay = () => {
       if (cfg.mode === "fast") return randInt(1000, 1500);
-      return randInt(3000, 5000);
+      return randInt(5000, 7000);
     };
 
     const localDayKey = (date = new Date()) =>
@@ -1346,12 +1357,63 @@
       return at.getTime() >= gateAt.getTime();
     };
 
+    const rememberSnapshot = (snapshot) => {
+      if (!snapshot || typeof snapshot !== "object") return;
+      lastSnapshot = snapshot;
+    };
+
+    const buildSnapshotSummary = (snapshot) => {
+      if (!snapshot || typeof snapshot !== "object") return "";
+      const totals = sumResources(snapshot.slots || []);
+      const used = getBagUsed(snapshot);
+      const capacity = getCapacity(snapshot);
+      const filledSlots = countFilledSlots(snapshot.slots || []);
+      const dailyMined = getDailyMined(snapshot);
+      const dailyLimit = getDailyLimit(snapshot);
+      return `[FINAL] GOLD:${totals.gold} | SILVER:${totals.silver} | BRONZE:${totals.bronze} | Bag:${used}/${capacity} (slots:${filledSlots}) | Daily:${dailyMined}/${dailyLimit}`;
+    };
+
+    const forceRefresh = (reason) => {
+      if (refreshTriggered) return;
+      refreshTriggered = true;
+      warn(`[CF] ${reason}. Force refresh page in 60s...`);
+      stop("cloudflare_challenge_force_refresh");
+      setTimeout(() => {
+        location.reload();
+      }, 60_000);
+    };
+
     const stop = (reason) => {
       if (state.done) return;
       state.running = false;
       state.done = true;
       state.reason = reason || "stopped";
       log("Stop:", state.reason);
+      if (!finalSummaryLogged) {
+        finalSummaryLogged = true;
+        const summary = buildSnapshotSummary(lastSnapshot);
+        if (summary) {
+          log(summary);
+        } else {
+          const token = getToken();
+          if (token) {
+            fetchCharacter(token)
+              .then((latest) => {
+                const latestSummary = buildSnapshotSummary(latest);
+                if (latestSummary) {
+                  log(latestSummary);
+                } else {
+                  log("[FINAL] Snapshot belum tersedia.");
+                }
+              })
+              .catch(() => {
+                log("[FINAL] Snapshot belum tersedia.");
+              });
+          } else {
+            log("[FINAL] Snapshot belum tersedia.");
+          }
+        }
+      }
       if (typeof state.resolve === "function") {
         state.resolve({ ok: true, reason: state.reason });
       }
@@ -1397,14 +1459,77 @@
           headers: { Authorization: `Bearer ${token}` }
         });
         if (!res.ok) return null;
-        return await res.json();
+        const data = await res.json();
+        rememberSnapshot(data);
+        return data;
       } catch {
         return null;
       }
     };
 
+    const fetchRocksSnapshot = async (token) => {
+      try {
+        const url = `${cfg.rocksSnapshotPath}?mapId=${encodeURIComponent(cfg.mapId)}`;
+        const res = await fetch(url, {
+          credentials: "include",
+          headers: {
+            accept: "*/*",
+            Authorization: `Bearer ${token}`
+          }
+        });
+        const raw = await res.text();
+        if (isCloudflareChallenge(raw)) {
+          forceRefresh("Cloudflare challenge detected on rocks snapshot");
+          return null;
+        }
+        if (!res.ok) {
+          warn(`[ROCK] Snapshot failed (${res.status}): ${raw}`);
+          return null;
+        }
+        const data = safeJson(raw);
+        if (!data || typeof data !== "object" || !Array.isArray(data.rocks)) {
+          warn("[ROCK] Snapshot invalid payload:", data);
+          return null;
+        }
+        return data.rocks;
+      } catch (err) {
+        warn("[ROCK] Snapshot network error:", err);
+        return null;
+      }
+    };
+
+    const pickRandomAliveRock = async (token, reason = "unspecified") => {
+      const rocks = await fetchRocksSnapshot(token);
+      if (!rocks) return { ok: false, waitMs: 5_000 };
+
+      const available = rocks
+        .filter((r) => {
+          const idx = Number(r?.rockIndex);
+          const hp = Number(r?.healthPct);
+          return Number.isInteger(idx)
+            && idx >= cfg.rockMin
+            && idx <= cfg.rockMax
+            && Number.isFinite(hp)
+            && hp > 0;
+        })
+        .map((r) => ({ rockIndex: Number(r.rockIndex), healthPct: Number(r.healthPct) }));
+
+      const emptyWaitMs = Number(cfg.allRocksEmptyWaitMs || cfg.allRocksInvalidWaitMs || 600_000);
+      if (!available.length) {
+        rockIndex = null;
+        log(`[ROCK] All rocks healthPct=0. Wait ${Math.ceil(emptyWaitMs / 60000)}m before retry.`);
+        return { ok: false, waitMs: emptyWaitMs, allDepleted: true };
+      }
+
+      const picked = available[randInt(0, available.length - 1)];
+      rockIndex = picked.rockIndex;
+      log(`[ROCK] Selected rock ${rockIndex} [${reason}] (healthPct=${picked.healthPct}).`);
+      return { ok: true, rockIndex: picked.rockIndex, healthPct: picked.healthPct };
+    };
+
     const logCharacter = (data) => {
       if (!data) return;
+      rememberSnapshot(data);
       const totals = sumResources(data.slots || []);
       const capacity = getCapacity(data);
       const used = getBagUsed(data);
@@ -1581,13 +1706,17 @@
       await sellSilverBronzeAll(token, snapshot);
     };
 
-    const extractSnapshotFromMining = (data) => ({
-      character: data?.character || {},
-      slots: data?.slots || [],
-      dailyMinedToday: data?.dailyMinedToday,
-      dailyMiningLimit: data?.dailyMiningLimit,
-      capacity: data?.capacity
-    });
+    const extractSnapshotFromMining = (data) => {
+      const snapshot = {
+        character: data?.character || {},
+        slots: data?.slots || [],
+        dailyMinedToday: data?.dailyMinedToday,
+        dailyMiningLimit: data?.dailyMiningLimit,
+        capacity: data?.capacity
+      };
+      rememberSnapshot(snapshot);
+      return snapshot;
+    };
 
     const isBackpackFull = (snapshot) => {
       const capacity = getCapacity(snapshot);
@@ -1604,61 +1733,6 @@
     const getLatestSnapshot = async (token, fallbackSnapshot) => {
       const latest = await fetchCharacter(token);
       return latest || fallbackSnapshot;
-    };
-
-    const fetchRocksSnapshot = async (token) => {
-      try {
-        const url = `${cfg.rocksSnapshotPath}?mapId=${encodeURIComponent(cfg.mapId)}`;
-        const res = await fetch(url, {
-          credentials: "include",
-          headers: {
-            accept: "*/*",
-            Authorization: `Bearer ${token}`
-          }
-        });
-        const text = await res.text();
-        if (!res.ok) {
-          warn(`[ROCK] Snapshot failed (${res.status}): ${text}`);
-          return null;
-        }
-        const data = safeJson(text);
-        if (!data || typeof data !== "object" || !Array.isArray(data.rocks)) {
-          warn("[ROCK] Snapshot invalid payload:", data);
-          return null;
-        }
-        return data.rocks;
-      } catch (err) {
-        warn("[ROCK] Snapshot network error:", err);
-        return null;
-      }
-    };
-
-    const pickRandomAliveRock = async (token, reason = "unspecified") => {
-      const rocks = await fetchRocksSnapshot(token);
-      if (!rocks) return { ok: false, waitMs: 5_000 };
-
-      const available = rocks
-        .filter((r) => {
-          const idx = Number(r?.rockIndex);
-          const hp = Number(r?.healthPct);
-          return Number.isInteger(idx)
-            && idx >= cfg.rockMin
-            && idx <= cfg.rockMax
-            && Number.isFinite(hp)
-            && hp > 0;
-        })
-        .map((r) => ({ rockIndex: Number(r.rockIndex), healthPct: Number(r.healthPct) }));
-
-      if (!available.length) {
-        rockIndex = null;
-        log(`[ROCK] All rocks healthPct=0. Wait ${Math.ceil(cfg.allRocksEmptyWaitMs / 60000)}m before retry.`);
-        return { ok: false, waitMs: cfg.allRocksEmptyWaitMs, allDepleted: true };
-      }
-
-      const picked = available[randInt(0, available.length - 1)];
-      rockIndex = picked.rockIndex;
-      log(`[ROCK] Selected rock ${rockIndex} from snapshot [${reason}] (healthPct=${picked.healthPct}).`);
-      return { ok: true, rockIndex: picked.rockIndex, healthPct: picked.healthPct };
     };
 
     const evaluateLimitsOrStop = async (token, fallbackSnapshot) => {
@@ -1740,6 +1814,10 @@
 
         if (!res.ok) {
           const raw = await res.text();
+          if (isCloudflareChallenge(raw)) {
+            forceRefresh("Cloudflare challenge detected on mining hit");
+            return;
+          }
           let errBody = null;
           try { errBody = JSON.parse(raw); } catch {}
 
@@ -1761,14 +1839,23 @@
             return;
           }
 
-          log(`[HIT] Rock ${rockIndex} unavailable (${res.status}) ${raw ? `| ${raw}` : ""}`);
-          rockIndex = null;
+          log(`[HIT] Rock ${rockIndex} failed (${res.status}) ${raw ? `| ${raw}` : ""} | retry same rock.`);
 
           setTimeout(hitLoop, 1_000);
           return;
         }
 
-        const data = await res.json();
+        const rawOk = await res.text();
+        if (isCloudflareChallenge(rawOk)) {
+          forceRefresh("Cloudflare challenge detected on mining hit (status 200)");
+          return;
+        }
+        const data = safeJson(rawOk);
+        if (!data || typeof data !== "object") {
+          warn("[HIT] Unexpected non-JSON response payload. Retry same rock.");
+          setTimeout(hitLoop, 1_000);
+          return;
+        }
         if (data?.error === "daily_limit_reached") {
           stop("daily_limit_reached");
           return;
@@ -1826,6 +1913,9 @@
       nextSellAt = cfg.sellEverySuccess;
       lastNearFullSellAttemptAt = 0;
       timedOneShotSellTriggered = false;
+      lastSnapshot = null;
+      finalSummaryLogged = false;
+      refreshTriggered = false;
 
       const token = getToken();
       if (!token) {
