@@ -1,7 +1,7 @@
 (() => {
   const BUILD_META = {
-    version: "v1.0.4",
-    lastUpdated: "2026-03-24 07:44:55 ICT"
+    version: "v1.0.5",
+    lastUpdated: "2026-03-24 07:58:41 ICT"
   };
 
   if (window.pvDaily) {
@@ -145,6 +145,8 @@
       rockMax: 5,
       sellEverySuccess: 25,
       autoSellEnabled: true,
+      autoSellAfterTimeEnabled: true,
+      autoSellStartTime: { hour: 13, minute: 0 },
       autoPreSellBeforeMining: true,
       autoUpgradeEfficiencyBeforeMining: true,
       autoUpgradeEfficiencyAfterSell: true,
@@ -1318,6 +1320,7 @@
     let successCount = 0;
     let nextSellAt = cfg.sellEverySuccess;
     let lastNearFullSellAttemptAt = 0;
+    let timedOneShotSellTriggered = false;
 
     const getToken = () => {
       const detected = detectToken();
@@ -1327,6 +1330,20 @@
     const getDelay = () => {
       if (cfg.mode === "fast") return randInt(1000, 1500);
       return randInt(3000, 5000);
+    };
+
+    const localDayKey = (date = new Date()) =>
+      `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+    const sellStartLabel = () =>
+      `${String(cfg.autoSellStartTime.hour).padStart(2, "0")}:${String(cfg.autoSellStartTime.minute).padStart(2, "0")}`;
+
+    const isAutoSellTimeReached = (at = new Date()) => {
+      if (!cfg.autoSellEnabled) return false;
+      if (!cfg.autoSellAfterTimeEnabled) return true;
+      const gateAt = new Date(at);
+      gateAt.setHours(cfg.autoSellStartTime.hour, cfg.autoSellStartTime.minute, 0, 0);
+      return at.getTime() >= gateAt.getTime();
     };
 
     const stop = (reason) => {
@@ -1525,8 +1542,21 @@
       }
     };
 
+    const maybeTriggerTimedOneShotSell = async (token, reason = "unspecified") => {
+      if (!cfg.autoSellEnabled) return false;
+      if (!cfg.autoSellAfterTimeEnabled) return false;
+      if (timedOneShotSellTriggered) return false;
+      if (!isAutoSellTimeReached()) return false;
+
+      timedOneShotSellTriggered = true;
+      log(`[SELL-TIME] Time gate reached (${sellStartLabel()}). Trigger one-time sell [${reason}]...`);
+      await sellSilverBronzeAll(token, null);
+      return true;
+    };
+
     const maybeAutoSell = async (token, snapshot) => {
       if (!cfg.autoSellEnabled) return;
+      if (!isAutoSellTimeReached()) return;
       const capacity = getCapacity(snapshot);
       const used = getBagUsed(snapshot);
       const freeCapacity = Math.max(capacity - used, 0);
@@ -1648,6 +1678,10 @@
           stop("backpack_full_auto_sell_disabled");
           return;
         }
+        if (!isAutoSellTimeReached()) {
+          stop("backpack_full_auto_sell_time_not_reached");
+          return;
+        }
 
         log("[BAG] Full and level >= 3. Try sell silver/bronze first...");
         const sellResult = await sellSilverBronzeAll(token, latest);
@@ -1678,6 +1712,8 @@
         stop("token_missing");
         return;
       }
+
+      await maybeTriggerTimedOneShotSell(token, "hit_loop");
 
       if (!Number.isInteger(rockIndex) || rockIndex < cfg.rockMin || rockIndex > cfg.rockMax) {
         const selected = await pickRandomAliveRock(token, "no_current_target");
@@ -1789,6 +1825,7 @@
       successCount = 0;
       nextSellAt = cfg.sellEverySuccess;
       lastNearFullSellAttemptAt = 0;
+      timedOneShotSellTriggered = false;
 
       const token = getToken();
       if (!token) {
@@ -1803,11 +1840,17 @@
         log("[START] Skip pre-mining efficiency upgrade (disabled by config).");
       }
 
-      if (cfg.autoPreSellBeforeMining && cfg.autoSellEnabled) {
+      await maybeTriggerTimedOneShotSell(token, "run_start");
+
+      if (cfg.autoPreSellBeforeMining && cfg.autoSellEnabled && isAutoSellTimeReached()) {
         log("[START] Pre-sell silver+bronze before mining...");
         await sellSilverBronzeAll(token, null);
       } else {
-        log("[START] Skip pre-sell before mining (disabled by config).");
+        if (!cfg.autoPreSellBeforeMining || !cfg.autoSellEnabled) {
+          log("[START] Skip pre-sell before mining (disabled by config).");
+        } else {
+          log(`[START] Skip pre-sell before mining (waiting sell time gate ${sellStartLabel()}).`);
+        }
       }
 
       const charData = await fetchCharacter(token);
