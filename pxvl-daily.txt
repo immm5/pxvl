@@ -1,7 +1,7 @@
 (() => {
   const BUILD_META = {
-    version: "v1.0.13",
-    lastUpdated: "2026-03-24 09:33:06 ICT"
+    version: "v1.0.14",
+    lastUpdated: "2026-03-24 09:41:20 ICT"
   };
 
   if (window.pvDaily) {
@@ -144,6 +144,7 @@
       rockMin: 0,
       rockMax: 5,
       rocksSnapshotPath: "/api/mining/rocks",
+      rockResetHoursUtc: [0, 6, 12, 18],
       allRocksEmptyWaitMs: 600_000,
       allRocksInvalidWaitMs: 600_000,
       sellEverySuccess: 25,
@@ -1357,6 +1358,31 @@
       return at.getTime() >= gateAt.getTime();
     };
 
+    const getNextRockResetPlan = (from = new Date()) => {
+      const hoursRaw = Array.isArray(cfg.rockResetHoursUtc) ? cfg.rockResetHoursUtc : [];
+      const hours = [...new Set(
+        hoursRaw
+          .map((h) => Number(h))
+          .filter((h) => Number.isInteger(h) && h >= 0 && h <= 23)
+      )].sort((a, b) => a - b);
+      if (!hours.length) return null;
+
+      const nowMs = from.getTime();
+      const y = from.getUTCFullYear();
+      const m = from.getUTCMonth();
+      const d = from.getUTCDate();
+
+      for (const hour of hours) {
+        const at = new Date(Date.UTC(y, m, d, hour, 0, 0, 0));
+        if (at.getTime() > nowMs) {
+          return { at, waitMs: Math.max(1_000, at.getTime() - nowMs) };
+        }
+      }
+
+      const at = new Date(Date.UTC(y, m, d + 1, hours[0], 0, 0, 0));
+      return { at, waitMs: Math.max(1_000, at.getTime() - nowMs) };
+    };
+
     const rememberSnapshot = (snapshot) => {
       if (!snapshot || typeof snapshot !== "object") return;
       lastSnapshot = snapshot;
@@ -1516,6 +1542,14 @@
 
       const emptyWaitMs = Number(cfg.allRocksEmptyWaitMs || cfg.allRocksInvalidWaitMs || 600_000);
       if (!available.length) {
+        const resetPlan = getNextRockResetPlan();
+        if (resetPlan) {
+          const etaMinutes = Math.ceil(resetPlan.waitMs / 60000);
+          rockIndex = null;
+          log(`[ROCK] All rocks healthPct=0. Pause until reset ${resetPlan.at.toISOString()} UTC (~${etaMinutes}m).`);
+          return { ok: false, waitMs: resetPlan.waitMs, allDepleted: true, waitUntilUtc: resetPlan.at.toISOString() };
+        }
+
         rockIndex = null;
         log(`[ROCK] All rocks healthPct=0. Wait ${Math.ceil(emptyWaitMs / 60000)}m before retry.`);
         return { ok: false, waitMs: emptyWaitMs, allDepleted: true };
@@ -1833,6 +1867,14 @@
             return;
           }
           if (errBody?.error === "rock_depleted") {
+            const resetPlan = getNextRockResetPlan();
+            if (resetPlan) {
+              const etaMinutes = Math.ceil(resetPlan.waitMs / 60000);
+              log(`[ROCK] Rock ${rockIndex} depleted. Pause until reset ${resetPlan.at.toISOString()} UTC (~${etaMinutes}m).`);
+              rockIndex = null;
+              setTimeout(hitLoop, resetPlan.waitMs);
+              return;
+            }
             log(`[ROCK] Rock ${rockIndex} already depleted (non-200 response). Pick another rock.`);
             rockIndex = null;
             setTimeout(hitLoop, 1_000);
@@ -1868,6 +1910,14 @@
           return;
         }
         if (data?.error === "rock_depleted") {
+          const resetPlan = getNextRockResetPlan();
+          if (resetPlan) {
+            const etaMinutes = Math.ceil(resetPlan.waitMs / 60000);
+            log(`[ROCK] Rock ${rockIndex} depleted. Pause until reset ${resetPlan.at.toISOString()} UTC (~${etaMinutes}m).`);
+            rockIndex = null;
+            setTimeout(hitLoop, resetPlan.waitMs);
+            return;
+          }
           log(`[ROCK] Rock ${rockIndex} depleted. Pick another rock.`);
           rockIndex = null;
           setTimeout(hitLoop, 1_000);
