@@ -150,7 +150,8 @@
       sellEverySuccess: 25,
       autoSellEnabled: true,
       autoSellAfterTimeEnabled: true,
-      autoSellStartTime: { hour: 9, minute: 0 },
+      autoSellBlockedWindowStart: { hour: 7, minute: 0 },
+      autoSellBlockedWindowEnd: { hour: 9, minute: 0 },
       autoPreSellBeforeMining: true,
       autoUpgradeEfficiencyBeforeMining: true,
       autoUpgradeEfficiencyAfterSell: true,
@@ -1347,15 +1348,28 @@
     const localDayKey = (date = new Date()) =>
       `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 
-    const sellStartLabel = () =>
-      `${String(cfg.autoSellStartTime.hour).padStart(2, "0")}:${String(cfg.autoSellStartTime.minute).padStart(2, "0")}`;
+    const sellBlockedWindowLabel = () =>
+      `${String(cfg.autoSellBlockedWindowStart.hour).padStart(2, "0")}:${String(cfg.autoSellBlockedWindowStart.minute).padStart(2, "0")}`
+      + ` - `
+      + `${String(cfg.autoSellBlockedWindowEnd.hour).padStart(2, "0")}:${String(cfg.autoSellBlockedWindowEnd.minute).padStart(2, "0")}`;
+
+    const isWithinBlockedSellWindow = (at = new Date()) => {
+      const start = new Date(at);
+      start.setHours(cfg.autoSellBlockedWindowStart.hour, cfg.autoSellBlockedWindowStart.minute, 0, 0);
+      const end = new Date(at);
+      end.setHours(cfg.autoSellBlockedWindowEnd.hour, cfg.autoSellBlockedWindowEnd.minute, 0, 0);
+
+      // Support both same-day (07:00-09:00) and cross-midnight windows.
+      if (end.getTime() <= start.getTime()) {
+        return at.getTime() >= start.getTime() || at.getTime() < end.getTime();
+      }
+      return at.getTime() >= start.getTime() && at.getTime() < end.getTime();
+    };
 
     const isAutoSellTimeReached = (at = new Date()) => {
       if (!cfg.autoSellEnabled) return false;
       if (!cfg.autoSellAfterTimeEnabled) return true;
-      const gateAt = new Date(at);
-      gateAt.setHours(cfg.autoSellStartTime.hour, cfg.autoSellStartTime.minute, 0, 0);
-      return at.getTime() >= gateAt.getTime();
+      return !isWithinBlockedSellWindow(at);
     };
 
     const getNextRockResetPlan = (from = new Date()) => {
@@ -1708,7 +1722,7 @@
       if (!isAutoSellTimeReached()) return false;
 
       timedOneShotSellTriggered = true;
-      log(`[SELL-TIME] Time gate reached (${sellStartLabel()}). Trigger one-time sell [${reason}]...`);
+      log(`[SELL-TIME] Allowed sell time (outside ${sellBlockedWindowLabel()}). Trigger one-time sell [${reason}]...`);
       await sellSilverBronzeAll(token, null);
       return true;
     };
@@ -1989,7 +2003,7 @@
         if (!cfg.autoPreSellBeforeMining || !cfg.autoSellEnabled) {
           log("[START] Skip pre-sell before mining (disabled by config).");
         } else {
-          log(`[START] Skip pre-sell before mining (waiting sell time gate ${sellStartLabel()}).`);
+          log(`[START] Skip pre-sell before mining (blocked in ${sellBlockedWindowLabel()}).`);
         }
       }
 
